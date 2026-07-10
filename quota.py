@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
 import httpx
@@ -418,8 +419,12 @@ def fetch_quota_by_account_id(account_id: str) -> dict[str, Any]:
     return fetch_quota_for_creds(creds)
 
 
-async def fetch_all_quotas(*, include_expired: bool = False) -> dict[str, Any]:
-    """Query quota for every live account; auto-disable exhausted ones."""
+async def fetch_all_quotas(
+    *,
+    include_expired: bool = False,
+    max_workers: int = 16,
+) -> dict[str, Any]:
+    """Query quota for every live account concurrently; auto-disable exhausted ones."""
     accounts = list_live_credentials(include_expired=include_expired, auto_refresh=True)
     # de-dupe by user_id
     seen: set[str] = set()
@@ -432,8 +437,21 @@ async def fetch_all_quotas(*, include_expired: bool = False) -> dict[str, Any]:
         unique.append(c)
 
     results: list[dict[str, Any]] = []
-    for c in unique:
-        results.append(await fetch_quota_for_creds_async(c))
+
+    def _fetch_one(creds: GrokCredentials) -> dict[str, Any]:
+        return fetch_quota_for_creds(creds)
+
+    workers = min(max_workers, max(1, len(unique)))
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="quota-") as ex:
+        for fut in as_completed(ex.submit(_fetch_one, c) for c in unique):
+            try:
+                results.append(fut.result())
+            except Exception as e:  # noqa: BLE001
+                results.append({
+                    "ok": False,
+                    "error": str(e)[:300],
+                    "fetched_at": time.time(),
+                })
 
     ok_count = sum(1 for r in results if r.get("ok"))
     exhausted_count = sum(1 for r in results if r.get("exhausted"))

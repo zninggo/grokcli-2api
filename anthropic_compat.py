@@ -40,6 +40,49 @@ class AnthropicMessagesRequest(BaseModel):
     container: Any | None = None
 
 
+# Anthropic thinking budget → OpenAI reasoning_effort mapping
+_THINKING_EFFORT_MAP: dict[str, str] = {
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+}
+
+
+def _anthropic_thinking_to_reasoning_effort(thinking: Any) -> str | None:
+    """
+    Convert Anthropic `thinking` field to OpenAI `reasoning_effort`.
+
+    Accepts:
+      - {"type": "enabled", "budget_tokens": 1024}
+      - {"type": "enabled", "budget_tokens": 32000}
+      - true / "enabled"
+      - "low" / "medium" / "high"
+    """
+    if thinking is None:
+        return None
+    if isinstance(thinking, str):
+        return _THINKING_EFFORT_MAP.get(thinking.lower())
+    if isinstance(thinking, bool):
+        return "medium" if thinking else None
+    if isinstance(thinking, dict):
+        ttype = (thinking.get("type") or "").lower()
+        if ttype not in ("enabled", ""):
+            return None
+        budget = thinking.get("budget_tokens")
+        try:
+            budget = int(budget) if budget is not None else None
+        except (TypeError, ValueError):
+            budget = None
+        if budget is None:
+            return "medium"
+        if budget <= 4096:
+            return "low"
+        if budget <= 16000:
+            return "medium"
+        return "high"
+    return None
+
+
 # ── content helpers ─────────────────────────────────────────────────────────
 
 
@@ -376,6 +419,10 @@ def build_openai_chat_body(
     # metadata.user_id → OpenAI user (affinity)
     if isinstance(req.metadata, dict) and req.metadata.get("user_id"):
         body["user"] = str(req.metadata["user_id"])
+    # Anthropic thinking → OpenAI reasoning_effort
+    effort = _anthropic_thinking_to_reasoning_effort(req.thinking)
+    if effort:
+        body["reasoning_effort"] = effort
     return body
 
 

@@ -22,6 +22,9 @@ def resolve_model(model: str | None) -> str:
     if not model:
         return DEFAULT_MODEL
     m = model.strip()
+    # grok-search always routes to default model with web search enabled
+    if m.lower() in ("grok-search", "web-search"):
+        return DEFAULT_MODEL
     return MODEL_ALIASES.get(m, MODEL_ALIASES.get(m.lower(), m))
 
 
@@ -66,6 +69,13 @@ def load_models_from_cache(path: Path | None = None) -> list[dict[str, Any]]:
                 "object": "model",
                 "created": int(time.time()),
                 "owned_by": "xai",
+            },
+            {
+                "id": "grok-search",
+                "object": "model",
+                "created": int(time.time()),
+                "owned_by": "xai",
+                "description": "Grok with web search enabled",
             },
         ]
     # stable order: default first

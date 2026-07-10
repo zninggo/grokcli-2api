@@ -276,13 +276,19 @@ def report_failure(
         )
     except Exception:
         pass
-    # Model unavailable → stop scheduling this account for that model
+    # Model unavailable → stop scheduling this account for that model ONLY if
+    # the error clearly names this model. Do not let errors from other models
+    # (e.g. a model-not-found for model A) block the account for model B.
     try:
-        from model_health import handle_upstream_error_for_model
+        from model_health import handle_upstream_error_for_model, is_model_unavailable_error
 
-        handle_upstream_error_for_model(
-            account_id, model=model, error=error, status_code=status_code
-        )
+        if model and is_model_unavailable_error(error, status_code):
+            # extra guard: ensure the error text references this model id
+            err_lower = (error or "").lower()
+            if model.lower() in err_lower or f"model `{model}`" in err_lower:
+                handle_upstream_error_for_model(
+                    account_id, model=model, error=error, status_code=status_code
+                )
     except Exception:
         pass
 

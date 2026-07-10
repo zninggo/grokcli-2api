@@ -98,6 +98,7 @@ class ImportSsoBody(BaseModel):
     )
     merge: bool = Field(default=True, description="Merge into existing auth.json")
     delay: int = Field(default=0, ge=0, le=300, description="Seconds between accounts")
+    max_workers: int = Field(default=4, ge=1, le=32, description="Concurrent import threads")
 
 
 class EmailRegistrationBody(BaseModel):
@@ -465,16 +466,17 @@ async def import_sso(
     ok = 0
     fail = 0
 
-    for i, (email_hint, sso) in enumerate(sso_items, 1):
+    def _import_one(args: tuple[int, str, str]) -> dict[str, Any]:
+        i, email_hint, sso = args
+        if body.delay > 0 and i > 1:
+            time.sleep(body.delay * (i - 1))
         item: dict[str, Any] = {"index": i, "sso_hint": sso[:12] + "..." if len(sso) > 12 else "..."}
         try:
-            token = await asyncio.to_thread(sso_import.sso_to_token, sso)
+            token = sso_import.sso_to_token(sso)
             if not token:
                 item["status"] = "failed"
                 item["error"] = "device flow failed or invalid sso"
-                fail += 1
-                results.append(item)
-                continue
+                return item
             key, entry = sso_import.token_to_auth_entry(token, email=email_hint)
             import_result = accounts.import_auth_payload(
                 {
@@ -491,9 +493,7 @@ async def import_sso(
             if not import_result.get("ok"):
                 item["status"] = "failed"
                 item["error"] = import_result.get("error") or "import failed"
-                fail += 1
-                results.append(item)
-                continue
+                return item
             info = (import_result.get("imported") or [{}])[0]
             item["status"] = "ok"
             item["account_id"] = info.get("id")
@@ -501,16 +501,30 @@ async def import_sso(
             item["user_id"] = info.get("user_id")
             item["expires_at"] = info.get("expires_at")
             item["has_refresh_token"] = info.get("has_refresh_token")
-            ok += 1
-            imported.append(info)
+            return item
         except Exception as e:  # noqa: BLE001
             item["status"] = "failed"
             item["error"] = str(e)
-            fail += 1
-        results.append(item)
+            return item
 
-        if body.delay > 0 and i < len(sso_cookies):
-            await asyncio.sleep(body.delay)
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    workers = min(body.max_workers, max(1, len(sso_items)))
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="sso-import-") as ex:
+        for fut in as_completed(ex.submit(_import_one, (i, e, s)) for i, (e, s) in enumerate(sso_items, 1)):
+            item = fut.result()
+            results.append(item)
+            if item.get("status") == "ok":
+                ok += 1
+                imported.append({
+                    "id": item.get("account_id"),
+                    "email": item.get("email"),
+                    "user_id": item.get("user_id"),
+                    "expires_at": item.get("expires_at"),
+                    "has_refresh_token": item.get("has_refresh_token"),
+                })
+            else:
+                fail += 1
 
     return {
         "ok": fail == 0,

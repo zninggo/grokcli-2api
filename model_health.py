@@ -11,6 +11,7 @@ import os
 import re
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
 import httpx
@@ -139,7 +140,7 @@ def handle_upstream_error_for_model(
     return None
 
 
-def _save_last_probe(account_id: str | None, result: dict[str, Any]) -> None:
+def _save_last_probe(account_id: str | None, result: dict[str, Any], *, overwrite: bool = True) -> None:
     """Persist probe snapshot on pool meta for admin UI."""
     if not account_id:
         return
@@ -161,8 +162,13 @@ def _save_last_probe(account_id: str | None, result: dict[str, Any]) -> None:
             "auto_disabled": bool(result.get("auto_disabled")),
             "stream_ok": result.get("stream_ok"),
         }
-        meta["last_probe"] = snap
-        if not snap["available"] and snap.get("error"):
+        # Only update last_probe if it's an explicit probe, or if there is no
+        # existing probe snapshot. API call failures must not overwrite the
+        # admin/model-health probe display.
+        existing = meta.get("last_probe")
+        if overwrite or not existing:
+            meta["last_probe"] = snap
+        if not snap["available"] and snap.get("error") and overwrite:
             meta["last_error"] = f"[probe {snap.get('model')}] {snap['error']}"[:300]
         elif snap["available"]:
             # clear probe-sourced last_error prefix only if success
@@ -253,7 +259,7 @@ def probe_model_for_creds(
                                 or action.get("blocked_models")
                                 or action.get("disabled_for_quota")
                             )
-                    _save_last_probe(creds.auth_key, base)
+                    _save_last_probe(creds.auth_key, base, overwrite=report_stats)
                     return base
 
                 got_data = False
@@ -284,7 +290,7 @@ def probe_model_for_creds(
                         account_pool.unblock_model(creds.auth_key, model)
                     except Exception:
                         pass
-                _save_last_probe(creds.auth_key, base)
+                _save_last_probe(creds.auth_key, base, overwrite=report_stats)
                 return base
     except httpx.HTTPError as e:
         base["error"] = f"network: {e}"
@@ -298,7 +304,7 @@ def probe_model_for_creds(
                 )
             except Exception:
                 pass
-        _save_last_probe(creds.auth_key, base)
+        _save_last_probe(creds.auth_key, base, overwrite=report_stats)
         return base
     except Exception as e:  # noqa: BLE001
         base["error"] = str(e)[:300]
@@ -312,7 +318,7 @@ def probe_model_for_creds(
                 )
             except Exception:
                 pass
-        _save_last_probe(creds.auth_key, base)
+        _save_last_probe(creds.auth_key, base, overwrite=report_stats)
         return base
 
 
@@ -378,13 +384,89 @@ def probe_account_models(
             creds_list.append(c)
 
     results: list[dict[str, Any]] = []
-    for creds in creds_list:
+
+    def _probe_one(args: tuple[GrokCredentials, str]) -> dict[str, Any]:
+        creds, model = args
+        return probe_model_for_creds(
+            creds, model, auto_disable=auto_disable, source=source
+        )
+
+    tasks = [(creds, model) for creds in creds_list for model in models]
+    workers = min(16, max(1, len(tasks)))
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="model-probe-") as ex:
+        for fut in as_completed(ex.submit(_probe_one, t) for t in tasks):
+            try:
+                results.append(fut.result())
+            except Exception as e:  # noqa: BLE001
+                results.append({
+                    "ok": False,
+                    "available": False,
+                    "error": str(e)[:300],
+                    "source": source,
+                    "probed_at": time.time(),
+                })
+
+    available = sum(1 for r in results if r.get("available"))
+    blocked = sum(
+        1 for r in results if not r.get("available") and r.get("auto_disabled")
+    )
+    return {
+        "ok": True,
+        "probed_at": time.time(),
+        "models": models,
+        "count": len(results),
+        "available_count": available,
+        "unavailable_count": len(results) - available,
+        "auto_action_count": blocked,
+        "results": results,
+        "source": source,
+    }
+
+
+def probe_all_accounts_concurrent(
+    models: list[str] | None = None,
+    *,
+    auto_disable: bool | None = None,
+    source: str = "manual",
+    max_workers: int = 16,
+) -> dict[str, Any]:
+    """Probe one model per account concurrently (admin UI "全部模型探测")."""
+    models = models or list(PROBE_MODELS) or [DEFAULT_MODEL]
+    all_c = list_live_credentials(include_expired=False, auto_refresh=True)
+    seen: set[str] = set()
+    creds_list: list[GrokCredentials] = []
+    for c in all_c:
+        uid = c.user_id or c.auth_key or ""
+        if uid in seen:
+            continue
+        seen.add(uid)
+        creds_list.append(c)
+
+    results: list[dict[str, Any]] = []
+
+    def _probe_account(creds: GrokCredentials) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
         for model in models:
-            results.append(
+            out.append(
                 probe_model_for_creds(
                     creds, model, auto_disable=auto_disable, source=source
                 )
             )
+        return out
+
+    workers = min(max_workers, max(1, len(creds_list)))
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="model-probe-") as ex:
+        for fut in as_completed(ex.submit(_probe_account, c) for c in creds_list):
+            try:
+                results.extend(fut.result())
+            except Exception as e:  # noqa: BLE001
+                results.append({
+                    "ok": False,
+                    "available": False,
+                    "error": str(e)[:300],
+                    "source": source,
+                    "probed_at": time.time(),
+                })
 
     available = sum(1 for r in results if r.get("available"))
     blocked = sum(

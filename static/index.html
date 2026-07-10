@@ -810,6 +810,17 @@
               <tbody id="accounts-tbody"></tbody>
             </table>
           </div>
+          <div class="row" id="accounts-pager" style="margin-top:12px;align-items:center;justify-content:center">
+            <button class="btn sm" id="acc-page-prev">上一页</button>
+            <span id="acc-page-info" class="muted" style="font-size:0.84rem">1 / 1</span>
+            <button class="btn sm" id="acc-page-next">下一页</button>
+            <select id="acc-page-size" style="max-width:90px">
+              <option value="10">10条</option>
+              <option value="25" selected>25条</option>
+              <option value="50">50条</option>
+              <option value="100">100条</option>
+            </select>
+          </div>
         </div>
 
         <div class="card">
@@ -919,8 +930,8 @@
             </div>
             <button class="btn sm" id="btn-export">导出 auth.json</button>
           </div>
-          <label for="import-file">选择 JSON 文件</label>
-          <input type="file" id="import-file" accept=".json,application/json,text/json,.txt" />
+          <label for="import-file">选择 JSON 文件（可多选）</label>
+          <input type="file" id="import-file" multiple accept=".json,application/json,text/json,.txt" />
           <div id="import-file-name" class="muted" style="margin-top:6px;font-size:0.82rem">未选择文件</div>
           <div class="row" style="margin-top:12px;align-items:center">
             <label style="display:flex;align-items:center;gap:8px;color:var(--text);margin:0">
@@ -1313,56 +1324,83 @@ function fmtQuotaCell(p, liveQuota) {
 }
 
 let quotaCache = {};
+let accountsList = [];
+let accountsPage = 1;
+let accountsPageSize = 25;
+
+function renderAccountsPage() {
+  const list = accountsList;
+  const pageSize = accountsPageSize;
+  const totalPages = Math.max(1, Math.ceil(list.length / pageSize));
+  accountsPage = Math.max(1, Math.min(accountsPage, totalPages));
+  const start = (accountsPage - 1) * pageSize;
+  const pageItems = list.slice(start, start + pageSize);
+
+  $("accounts-empty").classList.toggle("hidden", list.length > 0);
+  const tbody = $("accounts-tbody");
+  tbody.innerHTML = pageItems.map(a => {
+    const p = a._pool || { id: a.id };
+    const enabled = p.enabled !== false;
+    const cooling = p.in_cooldown;
+    const quotaOff = p.disabled_for_quota;
+    let poolLabel;
+    if (quotaOff) poolLabel = '<span class="pill bad">额度禁用</span>';
+    else if (!enabled) poolLabel = '<span class="pill bad">已禁用</span>';
+    else if (cooling) poolLabel = '<span class="pill warn">冷却中</span>';
+    else poolLabel = '<span class="pill ok">轮询中</span>';
+    const usage = `${p.success_count || 0}√ / ${p.fail_count || 0}× · 共 ${p.request_count || 0}`;
+    const refreshPill = a.has_refresh_token
+      ? '<span class="pill ok" title="可自动 refresh">可自动续期</span>'
+      : '<span class="pill warn">无 refresh</span>';
+    const liveQ = quotaCache[a.id];
+    const remCls = remainingClass(a.expires_at);
+    const remPill = remCls
+      ? `<span class="pill ${remCls}">剩余 ${esc(fmtRemaining(a.expires_at))}</span>`
+      : '<span class="muted">—</span>';
+    const probeCell = fmtProbeCell(p.last_probe, p.last_error, p.blocked_model_ids);
+    return `
+    <tr>
+      <td>${esc(a.email || "—")}<div class="muted mono" style="font-size:0.72rem">${esc(a.id)}</div></td>
+      <td>${a.expired ? '<span class="pill bad">已过期</span>' : '<span class="pill ok">有效</span>'}</td>
+      <td>${poolLabel}</td>
+      <td class="muted" style="font-size:0.8rem">${usage}</td>
+      <td style="font-size:0.82rem;min-width:140px">${fmtQuotaCell({ ...p, id: a.id }, liveQ)}</td>
+      <td style="font-size:0.78rem;min-width:160px">${probeCell}</td>
+      <td class="muted" style="font-size:0.8rem">
+        ${fmtTime(a.expires_at)}
+        <div style="margin-top:4px">${remPill} ${refreshPill}</div>
+      </td>
+      <td class="actions">
+        <button class="btn sm" data-act="probe-one" data-id="${esc(a.id)}">模型测试</button>
+        <button class="btn sm" data-act="quota-one" data-id="${esc(a.id)}">额度</button>
+        <button class="btn sm" data-act="toggle-acc" data-id="${esc(a.id)}" data-on="${enabled ? 0 : 1}">${enabled ? "禁用" : "启用"}</button>
+        <button class="btn sm danger" data-act="rm-acc" data-id="${esc(a.id)}">移除</button>
+      </td>
+    </tr>`;
+  }).join("") || `<tr><td colspan="8" class="muted">无账号</td></tr>`;
+
+  $("acc-page-info").textContent = `${accountsPage} / ${totalPages} (共 ${list.length} 个)`;
+  $("acc-page-prev").disabled = accountsPage <= 1;
+  $("acc-page-next").disabled = accountsPage >= totalPages;
+}
+
 function renderAccounts() {
   api("/accounts").then(data => {
     const pool = data.pool || {};
     const poolMap = {};
     (pool.accounts || []).forEach(a => { poolMap[a.id] = a; });
-    const list = data.accounts || [];
-    $("accounts-empty").classList.toggle("hidden", list.length > 0);
-    const tbody = $("accounts-tbody");
-    tbody.innerHTML = list.map(a => {
-      const p = poolMap[a.id] || { id: a.id };
-      const enabled = p.enabled !== false;
-      const cooling = p.in_cooldown;
-      const quotaOff = p.disabled_for_quota;
-      let poolLabel;
-      if (quotaOff) poolLabel = '<span class="pill bad">额度禁用</span>';
-      else if (!enabled) poolLabel = '<span class="pill bad">已禁用</span>';
-      else if (cooling) poolLabel = '<span class="pill warn">冷却中</span>';
-      else poolLabel = '<span class="pill ok">轮询中</span>';
-      const usage = `${p.success_count || 0}√ / ${p.fail_count || 0}× · 共 ${p.request_count || 0}`;
-      const refreshPill = a.has_refresh_token
-        ? '<span class="pill ok" title="可自动 refresh">可自动续期</span>'
-        : '<span class="pill warn">无 refresh</span>';
-      const liveQ = quotaCache[a.id];
-      const remCls = remainingClass(a.expires_at);
-      const remPill = remCls
-        ? `<span class="pill ${remCls}">剩余 ${esc(fmtRemaining(a.expires_at))}</span>`
-        : '<span class="muted">—</span>';
-      const probeCell = fmtProbeCell(p.last_probe, p.last_error, p.blocked_model_ids);
-      return `
-      <tr>
-        <td>${esc(a.email || "—")}<div class="muted mono" style="font-size:0.72rem">${esc(a.id)}</div></td>
-        <td>${a.expired ? '<span class="pill bad">已过期</span>' : '<span class="pill ok">有效</span>'}</td>
-        <td>${poolLabel}</td>
-        <td class="muted" style="font-size:0.8rem">${usage}</td>
-        <td style="font-size:0.82rem;min-width:140px">${fmtQuotaCell({ ...p, id: a.id }, liveQ)}</td>
-        <td style="font-size:0.78rem;min-width:160px">${probeCell}</td>
-        <td class="muted" style="font-size:0.8rem">
-          ${fmtTime(a.expires_at)}
-          <div style="margin-top:4px">${remPill} ${refreshPill}</div>
-        </td>
-        <td class="actions">
-          <button class="btn sm" data-act="probe-one" data-id="${esc(a.id)}">模型测试</button>
-          <button class="btn sm" data-act="quota-one" data-id="${esc(a.id)}">额度</button>
-          <button class="btn sm" data-act="toggle-acc" data-id="${esc(a.id)}" data-on="${enabled ? 0 : 1}">${enabled ? "禁用" : "启用"}</button>
-          <button class="btn sm danger" data-act="rm-acc" data-id="${esc(a.id)}">移除</button>
-        </td>
-      </tr>`;
-    }).join("") || `<tr><td colspan="8" class="muted">无账号</td></tr>`;
+    accountsList = (data.accounts || []).map(a => ({ ...a, _pool: poolMap[a.id] || { id: a.id } }));
+    renderAccountsPage();
   }).catch(e => toast(e.message, false));
 }
+
+$("acc-page-prev").onclick = () => { if (accountsPage > 1) { accountsPage--; renderAccountsPage(); } };
+$("acc-page-next").onclick = () => { accountsPage++; renderAccountsPage(); };
+$("acc-page-size").onchange = () => {
+  accountsPageSize = parseInt($("acc-page-size").value || "25", 10) || 25;
+  accountsPage = 1;
+  renderAccountsPage();
+};
 
 function fmtProbeCell(lastProbe, lastError, blockedIds) {
   const lp = lastProbe || null;
@@ -2001,30 +2039,51 @@ $("btn-copy-device").onclick = async () => {
 
 if ($("import-file")) {
   $("import-file").onchange = () => {
-    const f = $("import-file").files && $("import-file").files[0];
+    const files = $("import-file").files;
     const label = $("import-file-name");
     if (label) {
-      label.textContent = f
-        ? `已选择：${f.name}（${(f.size / 1024).toFixed(1)} KB）`
-        : "未选择文件";
+      if (!files || !files.length) {
+        label.textContent = "未选择文件";
+      } else if (files.length === 1) {
+        label.textContent = `已选择：${files[0].name}（${(files[0].size / 1024).toFixed(1)} KB）`;
+      } else {
+        const totalKb = Array.from(files).reduce((s, f) => s + f.size, 0) / 1024;
+        label.textContent = `已选择 ${files.length} 个文件（共 ${totalKb.toFixed(1)} KB）`;
+      }
     }
   };
 }
 $("btn-import").onclick = async () => {
   const input = $("import-file");
-  const f = input && input.files && input.files[0];
-  if (!f) return toast("请先选择 JSON 文件", false);
-  try {
-    const fd = new FormData();
-    fd.append("file", f);
-    fd.append("merge", $("import-merge").checked ? "true" : "false");
-    const r = await api("/accounts/import-file", { method: "POST", body: fd });
-    toast(r.message || `已导入 ${r.imported?.length || 0} 个账号`);
-    if (input) input.value = "";
-    if ($("import-file-name")) $("import-file-name").textContent = "未选择文件";
-    statusCache = await api("/status");
-    await loadDashboard();
-  } catch (e) { toast(e.message, false); }
+  const files = input && input.files;
+  if (!files || !files.length) return toast("请先选择 JSON 文件", false);
+  const merge = $("import-merge").checked ? "true" : "false";
+  let totalImported = 0;
+  let totalFailed = 0;
+  let lastMessage = "";
+  for (let i = 0; i < files.length; i++) {
+    const f = files[i];
+    try {
+      const fd = new FormData();
+      fd.append("file", f);
+      fd.append("merge", merge);
+      const r = await api("/accounts/import-file", { method: "POST", body: fd });
+      totalImported += r.imported?.length || 0;
+      lastMessage = r.message || `已导入 ${r.imported?.length || 0} 个账号`;
+    } catch (e) {
+      totalFailed++;
+      toast(`${f.name}: ${e.message}`, false);
+    }
+  }
+  if (files.length > 1) {
+    toast(`批量导入完成：${totalImported} 个账号成功，${totalFailed} 个文件失败`);
+  } else {
+    toast(lastMessage || `已导入 ${totalImported} 个账号`);
+  }
+  if (input) input.value = "";
+  if ($("import-file-name")) $("import-file-name").textContent = "未选择文件";
+  statusCache = await api("/status");
+  await loadDashboard();
 };
 if ($("btn-import-sso")) {
   $("btn-import-sso").onclick = async () => {

@@ -207,16 +207,30 @@ def _normalize_tools(tools: list[Any] | None) -> list[Any] | None:
             out.append(t)
             continue
         ttype = (t.get("type") or "function").lower()
-        # Built-in search tools: pass through unchanged
+        # Built-in search tools: normalize to upstream web_search_preview
         if ttype in ("web_search_preview", "web_search", "builtin_function"):
-            out.append(t)
+            # Upstream requires parameters field on every tool entry
+            normalized: dict[str, Any] = {
+                "type": "web_search_preview",
+                "parameters": {"type": "object", "properties": {}},
+            }
+            if isinstance(t.get("user_location"), dict):
+                normalized["user_location"] = t["user_location"]
+            if isinstance(t.get("search_context_size"), str):
+                normalized["search_context_size"] = t["search_context_size"]
+            out.append(normalized)
             continue
         if ttype != "function":
             # pass through other tool types as-is
             out.append(t)
             continue
         if isinstance(t.get("function"), dict):
-            out.append(t)
+            fn = t["function"]
+            # Ensure parameters is present for upstream deserialization
+            fn_out = dict(fn)
+            if "parameters" not in fn_out:
+                fn_out["parameters"] = {"type": "object", "properties": {}}
+            out.append({"type": "function", "function": fn_out})
             continue
         # flatten → nest
         name = t.get("name")
@@ -247,7 +261,7 @@ def _normalize_tool_choice(tool_choice: Any) -> Any:
         return tool_choice
     tc_type = (tool_choice.get("type") or "function").lower()
     if tc_type in ("web_search_preview", "web_search"):
-        return tool_choice
+        return {"type": "web_search_preview"}
     if tc_type != "function":
         return tool_choice
     fn = tool_choice.get("function")
@@ -291,6 +305,23 @@ def build_upstream_body(req: ChatCompletionRequest, model: str) -> dict[str, Any
 
     tools = _normalize_tools(req.tools)
     tool_choice = _normalize_tool_choice(req.tool_choice)
+    # If client asks for grok-search model, auto-inject web_search tool
+    if req.model and req.model.strip().lower() in ("grok-search", "web-search"):
+        search_tool = {
+            "type": "web_search_preview",
+            "parameters": {"type": "object", "properties": {}},
+        }
+        if not tools:
+            tools = [search_tool]
+        elif not any(
+            (t.get("type") or "").lower() in ("web_search_preview", "web_search")
+            for t in tools
+            if isinstance(t, dict)
+        ):
+            tools = tools + [search_tool]
+        if tool_choice is None:
+            tool_choice = {"type": "web_search_preview"}
+
     optional = {
         "temperature": req.temperature,
         "top_p": req.top_p,
