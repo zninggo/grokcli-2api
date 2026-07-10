@@ -102,12 +102,13 @@ def _on_startup() -> None:
     except Exception as e:  # noqa: BLE001
         print(f"  (model health failed: {e})")
     # Registration engine is optional — never block API startup.
+    # grok-build-auth is vendored in-tree (not a git submodule).
     try:
         import grok_build_adapter
 
         st = grok_build_adapter.registration_available()
         if st.get("available"):
-            print("  registration: grok-build-auth/xconsole_client ready")
+            print("  registration: vendored grok-build-auth ready")
         else:
             print(f"  registration: unavailable ({st.get('error')})")
     except Exception as e:  # noqa: BLE001

@@ -19,30 +19,17 @@ fi
 PY=python3
 command -v python3 >/dev/null 2>&1 || PY=python
 
-# Ensure git submodule for registration engine (best-effort)
-if [[ -f .gitmodules && ! -f grok-build-auth/xconsole_client/__init__.py ]]; then
-  echo "[INFO] Initializing git submodule: grok-build-auth ..."
-  if command -v git >/dev/null 2>&1; then
-    git submodule update --init --recursive || true
-  else
-    echo "[WARN] git not found; cannot auto-init submodule"
-    echo "       run manually: git submodule update --init --recursive"
-  fi
-fi
-
 if ! $PY -c "import fastapi, uvicorn, httpx" 2>/dev/null; then
   echo "Installing dependencies..."
   $PY -m pip install -r requirements.txt
 fi
 
-if [[ -f grok-build-auth/requirements.txt ]]; then
-  if ! $PY -c "import curl_cffi" 2>/dev/null; then
-    echo "Installing grok-build-auth dependencies..."
-    $PY -m pip install -r grok-build-auth/requirements.txt || true
-  fi
+if ! $PY -c "import curl_cffi, requests" 2>/dev/null; then
+  echo "Installing remaining dependencies..."
+  $PY -m pip install -r requirements.txt
 fi
 
-# Make xconsole_client importable
+# Vendored registration package path
 export PYTHONPATH="$(pwd)/grok-build-auth${PYTHONPATH:+:$PYTHONPATH}"
 
 # Sensible defaults for servers (multi-account pool)

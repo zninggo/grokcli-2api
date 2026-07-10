@@ -22,8 +22,8 @@ from auth import AuthError, load_credentials
 import config as _config
 import sso_to_auth_json as sso_import
 
-# Optional: registration adapter (needs grok-build-auth submodule + deps).
-# Never hard-fail process import if submodule is missing.
+# Optional: registration adapter (vendored grok-build-auth + optional deps).
+# Never hard-fail process import if registration deps are missing.
 try:
     import grok_build_adapter
 except Exception as _gba_import_err:  # noqa: BLE001
@@ -563,8 +563,7 @@ def _require_grok_build_adapter():
             detail=(
                 "注册机模块不可用: "
                 f"{_GBA_IMPORT_ERROR or 'grok_build_adapter import failed'}. "
-                "请执行: git submodule update --init --recursive && "
-                "pip install -r requirements.txt"
+                "请执行: pip install -r requirements.txt"
             ),
         )
     # Validate xconsole_client lazily so main API can still start.
@@ -575,7 +574,7 @@ def _require_grok_build_adapter():
             raise HTTPException(
                 status_code=503,
                 detail=st.get("error")
-                or "grok-build-auth/xconsole_client 不可用，请初始化子模块并安装依赖",
+                or "grok-build-auth/xconsole_client 不可用，请执行 pip install -r requirements.txt",
             )
     return grok_build_adapter
 

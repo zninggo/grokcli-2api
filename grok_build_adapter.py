@@ -9,8 +9,10 @@ Replaces the legacy email_registration.py flow by driving
 4. import the resulting CLIProxyAPI auth record into grokcli-2api's auth.json
 
 Import of ``xconsole_client`` is deferred so the main API can start even when
-the submodule / optional deps are missing. Registration endpoints then return
-a clear error instead of crashing process startup.
+optional deps are missing. Registration endpoints then return a clear error
+instead of crashing process startup.
+
+``grok-build-auth`` is vendored in-tree (not a git submodule).
 """
 from __future__ import annotations
 
@@ -65,7 +67,7 @@ def _compact_session(sess: dict[str, Any]) -> dict[str, Any]:
 
 
 def ensure_xconsole() -> None:
-    """Ensure grok-build-auth/xconsole_client is importable.
+    """Ensure vendored grok-build-auth/xconsole_client is importable.
 
     Raises RuntimeError with actionable message when unavailable.
     Safe to call multiple times.
@@ -78,20 +80,20 @@ def ensure_xconsole() -> None:
 
     if not GBA.is_dir():
         _xconsole_error = (
-            "grok-build-auth 目录不存在。请在项目根目录执行: "
-            "git submodule update --init --recursive"
+            "grok-build-auth 目录不存在。请确认仓库完整检出，"
+            "或重新 clone 本项目。"
         )
         raise RuntimeError(_xconsole_error)
 
     xc = GBA / "xconsole_client"
     if not xc.is_dir():
         _xconsole_error = (
-            "grok-build-auth/xconsole_client 不存在（子模块未初始化）。"
-            "请执行: git submodule update --init --recursive"
+            "grok-build-auth/xconsole_client 不存在。"
+            "请确认仓库完整检出（该目录已内置，不再使用 git submodule）。"
         )
         raise RuntimeError(_xconsole_error)
 
-    # Put submodule root on sys.path so `import xconsole_client` works.
+    # Put vendored package root on sys.path so `import xconsole_client` works.
     gba_str = str(GBA.resolve())
     if gba_str not in sys.path:
         sys.path.insert(0, gba_str)
@@ -116,13 +118,11 @@ def ensure_xconsole() -> None:
         missing = getattr(e, "name", None) or str(e)
         if missing in ("curl_cffi", "requests") or "curl_cffi" in str(e) or "requests" in str(e):
             _xconsole_error = (
-                f"注册机依赖缺失: {missing}。请执行: pip install -r requirements.txt "
-                f"以及 pip install -r grok-build-auth/requirements.txt"
+                f"注册机依赖缺失: {missing}。请执行: pip install -r requirements.txt"
             )
         else:
             _xconsole_error = (
-                f"无法导入 xconsole_client ({e})。请确认已执行 "
-                "git submodule update --init --recursive，并安装依赖。"
+                f"无法导入 xconsole_client ({e})。请执行: pip install -r requirements.txt"
             )
         raise RuntimeError(_xconsole_error) from e
     except Exception as e:  # noqa: BLE001
@@ -141,6 +141,7 @@ def registration_available() -> dict[str, Any]:
             "ok": True,
             "available": True,
             "path": str(GBA),
+            "vendored": True,
             "yescaptcha_configured": bool(YESCAPTCHA_KEY),
         }
     except Exception as e:  # noqa: BLE001
@@ -148,6 +149,7 @@ def registration_available() -> dict[str, Any]:
             "ok": False,
             "available": False,
             "path": str(GBA),
+            "vendored": True,
             "error": str(e),
             "yescaptcha_configured": bool(YESCAPTCHA_KEY),
         }

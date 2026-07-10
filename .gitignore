@@ -12,3 +12,9 @@ data/
 .idea/
 .vscode/
 register/
+# vendored registration runtime artifacts
+grok-build-auth/sso_output/
+grok-build-auth/oauth_output/
+grok-build-auth/accounts_output/
+grok-build-auth/cliproxyapi_auth/
+grok-build-auth/**/__pycache__/
