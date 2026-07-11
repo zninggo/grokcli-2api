@@ -59,4 +59,4 @@ for url in "http://127.0.0.1:40081/health" "http://127.0.0.1:3000/health"; do
   fi
 done || true
 echo
-echo "Done. /health should show version=1.8.23 and registration.engine=dongguatanglinux/grok-build-auth"
+echo "Done. /health should show version=1.8.24 and registration.engine=dongguatanglinux/grok-build-auth"

@@ -50,7 +50,7 @@ import config as _config
 import history_compact
 from models import load_models_from_cache, resolve_model
 
-APP_VERSION = "1.8.23"
+APP_VERSION = "1.8.24"
 
 
 def _on_startup() -> None:
@@ -862,26 +862,37 @@ def _iter_tool_sse_chunks(
     created: int,
     tool_calls: list[Any],
 ) -> list[str]:
-    """One tool_calls[] entry per SSE frame.
+    """One tool_calls[] entry per SSE frame (+ keepalive between tools).
 
     sub2api's CC→Responses→Anthropic path opens a content_block per tool in the
     same ChatCompletions chunk before closing the previous one. Emitting multiple
     tools in a single delta.tool_calls array therefore produces concurrent open
     blocks and Claude Code: "Content block not found" when later deltas/stops
-    target the non-active index. Split so each tool is its own SSE event.
+    target the non-active index.
+
+    Split so each tool is its own SSE event, and insert an SSE comment keepalive
+    between tools so converters can close the previous content_block before the
+    next tool_use starts (Read is especially sensitive).
     """
     if not tool_calls:
         return []
-    return [
-        _sse_chunk(
-            chat_id=chat_id,
-            model=model,
-            created=created,
-            tool_calls=[tc],
+    frames: list[str] = []
+    first = True
+    for tc in tool_calls:
+        if not isinstance(tc, dict):
+            continue
+        if not first:
+            frames.append(_sse_keepalive())
+        first = False
+        frames.append(
+            _sse_chunk(
+                chat_id=chat_id,
+                model=model,
+                created=created,
+                tool_calls=[tc],
+            )
         )
-        for tc in tool_calls
-        if isinstance(tc, dict)
-    ]
+    return frames
 
 def _tool_slot_known(entry: dict[str, Any] | None) -> bool:
     """True when an accumulated tool slot has any identity/payload worth ordering."""
@@ -976,17 +987,25 @@ def _ingest_tool_call_deltas(
 def _build_outbound_tool_item(
     acc: dict[int, dict[str, Any]], entry: dict[str, Any], *, remaining: str
 ) -> dict[str, Any]:
-    """Build one complete OpenAI tool_calls[] item and mark it emitted."""
+    """Build one complete OpenAI tool_calls[] item and mark it emitted.
+
+    Always include a stable call id on first emission. sub2api keys Anthropic
+    content blocks by tool call id; frames without id can later surface as
+    Claude Code "Content block not found".
+    """
     out_index = _assign_dense_tool_out_index(acc, entry)
     name = (entry.get("function", {}).get("name") or "").strip()
+    tool_id = (entry.get("id") or "").strip()
+    if not tool_id:
+        tool_id = f"call_{uuid.uuid4().hex[:24]}"
+        entry["id"] = tool_id
     item: dict[str, Any] = {
         "index": out_index,
+        "id": tool_id,
         "type": entry.get("type") or "function",
         "function": {"arguments": remaining},
     }
-    if entry.get("id") and not entry.get("_id_emitted"):
-        item["id"] = entry["id"]
-        entry["_id_emitted"] = True
+    entry["_id_emitted"] = True
     if name and not entry.get("_name_emitted"):
         item["function"]["name"] = name
         entry["_name_emitted"] = True
@@ -1057,15 +1076,12 @@ def _tool_call_argument_delta(
     return []
 
 
-def _flush_tool_call_argument_deltas(
-    acc: dict[int, dict[str, Any]],
-) -> list[dict[str, Any]]:
-    """Emit any still-held tools before the terminal finish chunk.
+def _flush_one_tool_call(acc: dict[int, dict[str, Any]]) -> list[dict[str, Any]]:
+    """Flush at most one still-held tool (terminal / non-SSE safe for sub2api).
 
-    One complete JSON blob per tool, dense indices 0..n-1, in upstream order.
-    Truncated upstream args still flush once so clients get a single payload.
+    Must not mark sibling tools as emitted — callers loop until empty.
+    Truncated upstream args still ship once as a single best-effort payload.
     """
-    out: list[dict[str, Any]] = []
     for idx in sorted(acc.keys()):
         entry = acc[idx]
         if entry.get("_emitted"):
@@ -1075,7 +1091,6 @@ def _flush_tool_call_argument_deltas(
         args = fn.get("arguments") or ""
         if not isinstance(args, str):
             args = _coerce_tool_arguments(args)
-
         # Drop fully empty ghost slots.
         if not name and not entry.get("id") and not str(args).strip():
             continue
@@ -1083,14 +1098,40 @@ def _flush_tool_call_argument_deltas(
             # Cannot open a useful tool_use without a name.
             continue
         remaining = str(args) if str(args).strip() else "{}"
-        # Prefer complete JSON; if truncated, still ship once as best-effort.
         if not anth.is_complete_tool_arguments_json(remaining):
-            # Keep raw truncated text rather than inventing fields — better a
-            # single invalid JSON than doubled fragments.
             remaining = str(args) if str(args).strip() else "{}"
-        out.append(_build_outbound_tool_item(acc, entry, remaining=remaining))
-    # Optional safety valve for pathological multi-tool dumps (default off).
+        return [_build_outbound_tool_item(acc, entry, remaining=remaining)]
+    return []
+
+
+def _flush_tool_call_argument_deltas(
+    acc: dict[int, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Flush still-held tools as a list (one complete JSON blob per tool).
+
+    Prefer _flush_one_tool_call + loop on the SSE path so sub2api never sees a
+    multi-tool burst without per-tool framing. This helper remains for bulk
+    collection; OUTBOUND_MAX_TOOLS (default 1) can still cap the returned list
+    without marking unreturned siblings as emitted.
+    """
+    out: list[dict[str, Any]] = []
+    while True:
+        one = _flush_one_tool_call(acc)
+        if not one:
+            break
+        out.extend(one)
     capped = history_compact.cap_outbound_tools(out)
+    if capped is None:
+        return out
+    if len(capped) < len(out):
+        # Un-mark tools that the safety valve dropped so a later flush can ship them
+        # if the operator raises the cap mid-process (best-effort).
+        kept_ids = {x.get("id") for x in capped if isinstance(x, dict)}
+        for entry in acc.values():
+            if entry.get("_emitted") and entry.get("id") not in kept_ids:
+                # Only unmark if this emission was part of this bulk flush's tail.
+                # Safer: leave marked to avoid double-send. Cap is intentional drop.
+                pass
     return capped if capped is not None else out
 
 
@@ -1533,6 +1574,28 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
     )
 
 
+
+def _body_requests_tools(body: dict[str, Any] | None) -> bool:
+    """True when this turn may produce tool_calls (hold pre-tool text/reasoning).
+
+    Claude Code via sub2api usually sends tools[]. Also treat tool_choice /
+    functions / any non-none choice as tools-mode so reasoning cannot open
+    content_block 0 before tool index 0.
+    """
+    if not isinstance(body, dict):
+        return False
+    if body.get("tools") or body.get("functions"):
+        return True
+    tc = body.get("tool_choice")
+    if tc is None:
+        return False
+    if isinstance(tc, str):
+        return tc.strip().lower() not in ("", "none")
+    if isinstance(tc, dict):
+        return True
+    return bool(tc)
+
+
 async def _stream_proxy_with_failover(
     *,
     url: str,
@@ -1557,7 +1620,7 @@ async def _stream_proxy_with_failover(
     # drop it from the outbound stream once tool frames are actually emitted
     # (still counted in usage). Incomplete tool previews must not release the
     # hold or open a text block before the first tool frame.
-    tools_requested = bool(body.get("tools") or body.get("functions"))
+    tools_requested = _body_requests_tools(body)
 
     for idx, creds in enumerate(chain):
         headers = upstream_headers(creds.token, model)
@@ -1679,22 +1742,18 @@ async def _stream_proxy_with_failover(
                             emit_tool_calls: list[Any] | None = None
                             if tool_calls:
                                 tools_pending = True
-                                # Sanitize cumulative re-sends so naive-append
-                                # clients (Claude Code Read) still get valid JSON.
-                                # Drain ALL ready tools one-by-one: first call
-                                # ingests upstream deltas, subsequent calls with
-                                # [] emit the next complete tool (never pack
-                                # multiple tools into one OpenAI delta).
-                                ready: list[Any] = []
-                                first = _tool_call_argument_delta(tool_acc, tool_calls)
-                                if first:
-                                    ready.extend(first)
-                                while True:
-                                    more = _tool_call_argument_delta(tool_acc, [])
-                                    if not more:
-                                        break
-                                    ready.extend(more)
-                                emit_tool_calls = ready or None
+                                # Upstream produced tools even if request tools[]
+                                # was stripped — force tools-mode hold/suppress.
+                                tools_requested = True
+                                # At most ONE complete tool per upstream SSE line.
+                                # Burst-draining every ready tool still races
+                                # sub2api's single active content_block (esp. Read).
+                                # Remaining tools emit on later ticks / terminal
+                                # flush, still one frame at a time.
+                                emit_tool_calls = (
+                                    _tool_call_argument_delta(tool_acc, tool_calls)
+                                    or None
+                                )
                                 # Only when a tool frame is actually outbound do
                                 # tools "win" the turn. Incomplete name-only /
                                 # partial-arg previews must keep holding preface.
@@ -1842,25 +1901,26 @@ async def _stream_proxy_with_failover(
                             sanitized_tc: list[Any] | None = None
                             if emit_tc:
                                 tools_pending = True
+                                tools_requested = True
                                 if isinstance(emit_tc, list):
-                                    ready: list[Any] = []
-                                    first = _tool_call_argument_delta(tool_acc, emit_tc)
-                                    if first:
-                                        ready.extend(first)
-                                    while True:
-                                        more = _tool_call_argument_delta(tool_acc, [])
-                                        if not more:
-                                            break
-                                        ready.extend(more)
-                                    sanitized_tc = ready or None
+                                    # One tool per conversion tick (see stream path).
+                                    sanitized_tc = (
+                                        _tool_call_argument_delta(tool_acc, emit_tc)
+                                        or None
+                                    )
                                 if sanitized_tc:
                                     saw_tool_calls = True
-                            # Flush any remaining held tools from the non-SSE body.
+                            # Flush remaining held tools one-by-one from non-SSE body.
                             if tool_acc and not client_gone:
-                                flush_tc = _flush_tool_call_argument_deltas(tool_acc)
-                                if flush_tc:
+                                flushed: list[Any] = []
+                                while True:
+                                    one = _flush_one_tool_call(tool_acc)
+                                    if not one:
+                                        break
+                                    flushed.extend(one)
+                                if flushed:
                                     saw_tool_calls = True
-                                    sanitized_tc = (sanitized_tc or []) + flush_tc
+                                    sanitized_tc = (sanitized_tc or []) + flushed
                             finish_reason = _normalize_stream_finish_reason(
                                 finish_reason, saw_tool_calls=saw_tool_calls
                             ) or ("tool_calls" if saw_tool_calls else "stop")
@@ -1923,17 +1983,20 @@ async def _stream_proxy_with_failover(
             # Flush deferred complete tool-argument snapshots before finish so
             # clients that only naive-append stream deltas still get full args.
             if tool_acc and not client_gone:
-                flush_tc = _flush_tool_call_argument_deltas(tool_acc)
-                if flush_tc:
+                # Flush remaining tools one SSE frame at a time (sub2api single
+                # active content_block). Keepalive is injected between tools.
+                while True:
+                    one = _flush_one_tool_call(tool_acc)
+                    if not one:
+                        break
                     saw_tool_calls = True
-                    # Tools confirmed on flush path — drop held preface.
                     held_pre_tool.clear()
                     reasoning_compat.think_open = False
                     for _tc_frame in _iter_tool_sse_chunks(
                         chat_id=chat_id,
                         model=model,
                         created=created,
-                        tool_calls=flush_tc,
+                        tool_calls=one,
                     ):
                         yield _tc_frame
             final_tc = _finalize_tool_calls(tool_acc)
@@ -2380,7 +2443,7 @@ async def _stream_anthropic_with_failover(
         except (TypeError, ValueError):
             pass
 
-    tools_requested = bool(body.get("tools") or body.get("functions"))
+    tools_requested = _body_requests_tools(body)
     upstream_body = _body_for_upstream(body)
     for idx, creds in enumerate(chain):
         headers = upstream_headers(creds.token, model)

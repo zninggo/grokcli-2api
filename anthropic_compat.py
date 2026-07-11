@@ -1347,19 +1347,31 @@ class AnthropicStreamAssembler:
             events.extend(self.start(input_tokens=int(input_tokens or 0)))
 
         # Decide whether tools won before opening text/thinking preface.
-        has_tool_payload = any(
+        # Only drop preface when a tool is truly ready or already on the wire.
+        # Mere _tools_pending (name-only / incomplete previews) must not discard
+        # a real text answer — that also avoids opening a ghost tool_use block
+        # that Claude Code later fails to find.
+        has_ready_tool = any(
+            (s.get("name") or "").strip()
+            and (s.get("args") or "").strip()
+            and is_complete_tool_arguments_json(s.get("args") or "")
+            and not s.get("stopped")
+            for s in self._tools.values()
+        )
+        has_any_tool_identity = any(
             (s.get("name") or s.get("id") or (s.get("args") or "").strip())
             and not s.get("stopped")
             for s in self._tools.values()
         )
-        if has_tool_payload or self._saw_tool or self._tools_pending:
-            # Tools path: drop held preface so first block can be tool_use.
+        if self._saw_tool or has_ready_tool:
+            # Real tools path: drop preface so first block can be tool_use.
             self._held_pre_tool.clear()
         elif self._held_pre_tool:
-            # Non-tool turn: flush held thinking/text now.
+            # Incomplete tool previews only — keep the text answer.
             for held_c, held_r in self._held_pre_tool:
                 events.extend(self._emit_text_and_thinking(held_c, held_r))
             self._held_pre_tool.clear()
+        # else: no preface; finish may still open known incomplete tools below
 
         events.extend(self._close_thinking())
         events.extend(self._close_text())
@@ -1372,7 +1384,23 @@ class AnthropicStreamAssembler:
             state = self._tools[oi]
             if state.get("stopped"):
                 continue
+            name = (state.get("name") or "").strip()
+            args = (state.get("args") or "").strip()
+            # Skip pure ghost previews (no name, no args) so we don't open a
+            # nameless tool_use that secondary clients can't close cleanly.
+            if not state.get("started") and not name and not args:
+                continue
             if not state.get("started"):
+                # If we still hold a non-tool preface and this tool is incomplete,
+                # prefer the text answer over a placeholder tool.
+                if (
+                    self._held_pre_tool
+                    and not self._saw_tool
+                    and not (
+                        name and args and is_complete_tool_arguments_json(args)
+                    )
+                ):
+                    continue
                 # Close any still-open prior tool before opening this one.
                 events.extend(self._close_tools())
                 if state.get("block_index") is None:
@@ -1386,7 +1414,7 @@ class AnthropicStreamAssembler:
                     anthropic_stream_block_start_tool(
                         state["block_index"],
                         tool_id=state["id"],
-                        name=(state.get("name") or "tool").strip() or "tool",
+                        name=name or "tool",
                     )
                 )
             # Close this tool (flush empty {} if needed) before the next.

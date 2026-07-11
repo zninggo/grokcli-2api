@@ -47,8 +47,10 @@ HISTORY_MAX_TOOL_RESULT_CHARS = _env_int(
 HISTORY_MAX_MESSAGES_CHARS = _env_int(
     "GROK2API_HISTORY_MAX_MESSAGES_CHARS", 280_000, minimum=8_000, maximum=5_000_000
 )
-# Optional: max tools to emit in one assistant turn (0 = unlimited). Safety valve only.
-OUTBOUND_MAX_TOOLS = _env_int("GROK2API_OUTBOUND_MAX_TOOLS", 0, minimum=0, maximum=64)
+# Max tools per assistant turn. Default 1: sub2api/Claude Code only keep one active
+# content_block; multi-tool frames still race to "Content block not found".
+# Set 0 for unlimited (not recommended behind sub2api).
+OUTBOUND_MAX_TOOLS = _env_int("GROK2API_OUTBOUND_MAX_TOOLS", 1, minimum=0, maximum=64)
 
 
 _PLACEHOLDER_PREFIX = "[compacted tool result"
