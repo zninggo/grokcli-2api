@@ -2,7 +2,7 @@
 
 把 **Grok OIDC 登录态** 转成 **OpenAI / Anthropic 兼容 API**，并附带 Web 管理台：多 API Key、多账号轮询、设备码 / 导入 / 协议注册。
 
-**当前版本：v1.8.25**
+**当前版本：v1.8.26**
 
 - **独立运行**：不依赖本地 Grok CLI，不调用 `grok login` / 浏览器 OAuth
 - **协议注册**：内置 `grok-build-auth`（HTTP 协议，无需 Chromium）
@@ -15,11 +15,12 @@
 
 ---
 
-## 本次更新（v1.8.25）
+## 本次更新（v1.8.26）
 
 - 修复 new-api Upstream **422** `tools[0]: missing field sources`：剥离已废弃 `live_search` / `web_search` 内置工具
 - 修复 Claude Code via sub2api：`API Error: Content block not found`
-- 出站 **每个上游 SSE 最多 1 个完整 tool**；多 tool 之间插 SSE keepalive；默认 `OUTBOUND_MAX_TOOLS=1`
+- 出站 **每个上游 SSE 最多 1 个完整 tool**；多 tool 之间插 SSE keepalive + **真实间隔**（`OUTBOUND_TOOL_GAP_SEC`，默认 0.08s）
+- 默认 `OUTBOUND_MAX_TOOLS=1`：整轮只放行 1 个 tool（防 sub2api 多 block 竞态）；需要并行 tool 时调高或设 0
 - 每个 tool 帧强制带稳定 `call_…` id；dense index；空 `{}` 不提前出站
 - 更宽的 tools-mode 判定（`tool_choice` / 上游 tool delta 也会 hold 前言）
 - **History compact**（默认关闭）仍可用；见 `.env.example`

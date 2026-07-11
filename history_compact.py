@@ -51,6 +51,19 @@ HISTORY_MAX_MESSAGES_CHARS = _env_int(
 # content_block; multi-tool frames still race to "Content block not found".
 # Set 0 for unlimited (not recommended behind sub2api).
 OUTBOUND_MAX_TOOLS = _env_int("GROK2API_OUTBOUND_MAX_TOOLS", 1, minimum=0, maximum=64)
+# Real wall-clock gap between consecutive outbound tool SSE frames (seconds).
+# SSE comment keepalives alone are not enough: sub2api often drains a TCP window
+# of back-to-back tool chunks in one converter tick and still races content_blocks.
+# 0 disables the delay (pure OpenAI clients).
+def _env_float(name: str, default: float, *, minimum: float = 0.0, maximum: float = 5.0) -> float:
+    try:
+        v = float(__import__("os").getenv(name, str(default)))
+    except (TypeError, ValueError):
+        v = default
+    return max(minimum, min(maximum, v))
+
+
+OUTBOUND_TOOL_GAP_SEC = _env_float("GROK2API_OUTBOUND_TOOL_GAP_SEC", 0.08, minimum=0.0, maximum=2.0)
 
 
 _PLACEHOLDER_PREFIX = "[compacted tool result"
@@ -362,3 +375,14 @@ def cap_outbound_tools(tool_calls: list[Any] | None) -> list[Any] | None:
     if len(tool_calls) <= OUTBOUND_MAX_TOOLS:
         return tool_calls
     return tool_calls[:OUTBOUND_MAX_TOOLS]
+
+
+def remaining_outbound_tool_budget(already_emitted: int) -> int | None:
+    """How many more tools may be shipped this turn.
+
+    None means unlimited (OUTBOUND_MAX_TOOLS <= 0). 0 means stop emitting.
+    """
+    if OUTBOUND_MAX_TOOLS <= 0:
+        return None
+    left = OUTBOUND_MAX_TOOLS - max(0, int(already_emitted or 0))
+    return max(0, left)

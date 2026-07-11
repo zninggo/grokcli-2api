@@ -50,7 +50,7 @@ import config as _config
 import history_compact
 from models import load_models_from_cache, resolve_model
 
-APP_VERSION = "1.8.25"
+APP_VERSION = "1.8.26"
 
 
 def _on_startup() -> None:
@@ -907,6 +907,10 @@ def _iter_tool_sse_chunks(
     Split so each tool is its own SSE event, and insert an SSE comment keepalive
     between tools so converters can close the previous content_block before the
     next tool_use starts (Read is especially sensitive).
+
+    Prefer `_emit_tool_sse_serial` on live streams — it also inserts a real
+    wall-clock gap (see GROK2API_OUTBOUND_TOOL_GAP_SEC) because keepalive-only
+    bursts still race when sub2api drains a whole TCP window in one tick.
     """
     if not tool_calls:
         return []
@@ -927,6 +931,46 @@ def _iter_tool_sse_chunks(
             )
         )
     return frames
+
+
+async def _emit_tool_sse_serial(
+    *,
+    chat_id: str,
+    model: str,
+    created: int,
+    tool_calls: list[Any],
+    already_emitted: int = 0,
+) -> AsyncIterator[str]:
+    """Yield tool SSE frames one-by-one with keepalive + optional real delay.
+
+    Respects OUTBOUND_MAX_TOOLS via remaining budget. Marks nothing in tool_acc —
+    callers must only pass already-built outbound items.
+    """
+    if not tool_calls:
+        return
+    budget = history_compact.remaining_outbound_tool_budget(already_emitted)
+    gap = float(getattr(history_compact, "OUTBOUND_TOOL_GAP_SEC", 0.0) or 0.0)
+    first = True
+    emitted_here = 0
+    for tc in tool_calls:
+        if not isinstance(tc, dict):
+            continue
+        if budget is not None and emitted_here >= budget:
+            break
+        if not first:
+            yield _sse_keepalive()
+            if gap > 0:
+                # Give sub2api time to close the previous content_block before
+                # the next tool_use start (Read is the usual failure case).
+                await asyncio.sleep(gap)
+        first = False
+        yield _sse_chunk(
+            chat_id=chat_id,
+            model=model,
+            created=created,
+            tool_calls=[tc],
+        )
+        emitted_here += 1
 
 def _tool_slot_known(entry: dict[str, Any] | None) -> bool:
     """True when an accumulated tool slot has any identity/payload worth ordering."""
@@ -1668,6 +1712,7 @@ async def _stream_proxy_with_failover(
         content_parts: list[str] = []
         reasoning_parts: list[str] = []
         tool_acc: dict[int, dict[str, Any]] = {}
+        tools_emitted_count = 0  # enforces OUTBOUND_MAX_TOOLS across the turn
         reasoning_compat = _ReasoningCompatState()
         # Buffered pre-tool emissions (OpenAI path only). Flushed only if the
         # turn ends without any outbound tool frames.
@@ -1784,10 +1829,24 @@ async def _stream_proxy_with_failover(
                                 # sub2api's single active content_block (esp. Read).
                                 # Remaining tools emit on later ticks / terminal
                                 # flush, still one frame at a time.
-                                emit_tool_calls = (
-                                    _tool_call_argument_delta(tool_acc, tool_calls)
-                                    or None
+                                budget = history_compact.remaining_outbound_tool_budget(
+                                    tools_emitted_count
                                 )
+                                if budget is not None and budget <= 0:
+                                    # Cap reached: still ingest for accounting, no emit.
+                                    _ingest_tool_call_deltas(tool_acc, tool_calls)
+                                    emit_tool_calls = None
+                                else:
+                                    emit_tool_calls = (
+                                        _tool_call_argument_delta(tool_acc, tool_calls)
+                                        or None
+                                    )
+                                    if (
+                                        emit_tool_calls
+                                        and budget is not None
+                                        and len(emit_tool_calls) > budget
+                                    ):
+                                        emit_tool_calls = emit_tool_calls[:budget]
                                 # Only when a tool frame is actually outbound do
                                 # tools "win" the turn. Incomplete name-only /
                                 # partial-arg previews must keep holding preface.
@@ -1870,13 +1929,20 @@ async def _stream_proxy_with_failover(
                                     )
                                 if emit_tool_calls:
                                     saw_tool_calls = True
-                                    for _tc_frame in _iter_tool_sse_chunks(
+                                    _n_before = tools_emitted_count
+                                    async for _tc_frame in _emit_tool_sse_serial(
                                         chat_id=chat_id,
                                         model=model,
                                         created=created,
                                         tool_calls=emit_tool_calls,
+                                        already_emitted=tools_emitted_count,
                                     ):
                                         yield _tc_frame
+                                        if _tc_frame.startswith("data: "):
+                                            tools_emitted_count += 1
+                                    # ensure monotonic even if only keepalives
+                                    if tools_emitted_count < _n_before:
+                                        tools_emitted_count = _n_before
                             elif finish:
                                 # finish-only upstream frame: content already held
                                 continue
@@ -1983,13 +2049,16 @@ async def _stream_proxy_with_failover(
                             # Tools first, then content only if this is a non-tool turn.
                             if sanitized_tc and not client_gone:
                                 saw_tool_calls = True
-                                for _tc_frame in _iter_tool_sse_chunks(
+                                async for _tc_frame in _emit_tool_sse_serial(
                                     chat_id=chat_id,
                                     model=model,
                                     created=created,
                                     tool_calls=sanitized_tc,
+                                    already_emitted=tools_emitted_count,
                                 ):
                                     yield _tc_frame
+                                    if _tc_frame.startswith("data: "):
+                                        tools_emitted_count += 1
                             if emit_content and not (
                                 tools_requested and saw_tool_calls
                             ):
@@ -2018,21 +2087,29 @@ async def _stream_proxy_with_failover(
             # clients that only naive-append stream deltas still get full args.
             if tool_acc and not client_gone:
                 # Flush remaining tools one SSE frame at a time (sub2api single
-                # active content_block). Keepalive is injected between tools.
+                # active content_block). Keepalive + wall-clock gap between tools.
                 while True:
+                    budget = history_compact.remaining_outbound_tool_budget(
+                        tools_emitted_count
+                    )
+                    if budget is not None and budget <= 0:
+                        break
                     one = _flush_one_tool_call(tool_acc)
                     if not one:
                         break
                     saw_tool_calls = True
                     held_pre_tool.clear()
                     reasoning_compat.think_open = False
-                    for _tc_frame in _iter_tool_sse_chunks(
+                    async for _tc_frame in _emit_tool_sse_serial(
                         chat_id=chat_id,
                         model=model,
                         created=created,
                         tool_calls=one,
+                        already_emitted=tools_emitted_count,
                     ):
                         yield _tc_frame
+                        if _tc_frame.startswith("data: "):
+                            tools_emitted_count += 1
             final_tc = _finalize_tool_calls(tool_acc)
             # Only treat as tool-finish when something was (or will be) emitted.
             if final_tc and any(

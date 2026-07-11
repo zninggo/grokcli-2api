@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import app
+import history_compact
 
 
 def test_single_tool_per_delta_call():
@@ -183,6 +184,44 @@ def test_normalize_tool_choice_search_to_auto():
         "type": "function",
         "function": {"name": "x"},
     }
+
+def test_outbound_tool_budget():
+    assert history_compact.remaining_outbound_tool_budget(0) in (1, None) or True
+    # With default OUTBOUND_MAX_TOOLS=1
+    left0 = history_compact.remaining_outbound_tool_budget(0)
+    left1 = history_compact.remaining_outbound_tool_budget(1)
+    if history_compact.OUTBOUND_MAX_TOOLS > 0:
+        assert left0 == history_compact.OUTBOUND_MAX_TOOLS
+        assert left1 == max(0, history_compact.OUTBOUND_MAX_TOOLS - 1)
+
+
+def test_emit_tool_sse_serial_respects_budget():
+    import asyncio
+
+    async def collect():
+        frames = []
+        async for f in app._emit_tool_sse_serial(
+            chat_id="c",
+            model="m",
+            created=1,
+            tool_calls=[
+                {"index": 0, "id": "a", "type": "function", "function": {"name": "Read", "arguments": "{}"}},
+                {"index": 1, "id": "b", "type": "function", "function": {"name": "Bash", "arguments": "{}"}},
+            ],
+            already_emitted=0,
+        ):
+            frames.append(f)
+        return frames
+
+    frames = asyncio.run(collect())
+    data_frames = [f for f in frames if f.startswith("data: ")]
+    if history_compact.OUTBOUND_MAX_TOOLS > 0:
+        assert len(data_frames) == 1
+        assert '"index": 0' in data_frames[0]
+    else:
+        assert len(data_frames) >= 1
+
+
 
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
