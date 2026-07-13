@@ -26,7 +26,11 @@ start_inline_solver() {
     return 0
   fi
   mkdir -p /app/turnstile-solver/logs /app/turnstile-solver/keys
-  echo "[entrypoint] starting inline turnstile-solver on ${solver_host}:${solver_port} (thread=${solver_thread}, browser=${solver_browser})"
+  # Lazy browsers (default): pool warms on first captcha, reclaims after idle.
+  # TURNSTILE_LAZY=0 restores eager warm-up. TURNSTILE_IDLE_SEC=0 disables reclaim.
+  export TURNSTILE_LAZY="${TURNSTILE_LAZY:-1}"
+  export TURNSTILE_IDLE_SEC="${TURNSTILE_IDLE_SEC:-180}"
+  echo "[entrypoint] starting inline turnstile-solver on ${solver_host}:${solver_port} (thread=${solver_thread}, browser=${solver_browser}, lazy=${TURNSTILE_LAZY}, idle=${TURNSTILE_IDLE_SEC}s)"
   (
     cd /app/turnstile-solver
     exec python api_solver.py \

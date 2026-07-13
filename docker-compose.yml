@@ -54,8 +54,8 @@ services:
       GROK2API_MODEL_HEALTH: "1"
       GROK2API_REASONING_COMPAT: "off"
       GROK2API_STORE_BACKEND: "hybrid"
-      # High-concurrency: multi-worker (override in .env)
-      GROK2API_WORKERS: "${GROK2API_WORKERS:-4}"
+      # Multi-worker: default 2 (enough for hybrid; override via .env for large hosts)
+      GROK2API_WORKERS: "${GROK2API_WORKERS:-2}"
       # In-stack service DNS (do not use 127.0.0.1 here)
       REDIS_URL: "redis://redis:6379/0"
       GROK2API_REDIS_URL: "redis://redis:6379/0"
@@ -73,6 +73,9 @@ services:
       GROK2API_REG_CONCURRENCY: "${GROK2API_REG_CONCURRENCY:-3}"
       TURNSTILE_THREAD: "${TURNSTILE_THREAD:-${GROK2API_REG_CONCURRENCY:-3}}"
       TURNSTILE_BROWSER_TYPE: "${TURNSTILE_BROWSER_TYPE:-camoufox}"
+      # Idle memory: warm browsers only when solving captcha; reclaim after quiet period
+      TURNSTILE_LAZY: "${TURNSTILE_LAZY:-1}"
+      TURNSTILE_IDLE_SEC: "${TURNSTILE_IDLE_SEC:-180}"
     healthcheck:
       # $$ keeps substitution inside the container so override ports (e.g. 40081) work
       test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:$${GROK2API_PORT:-3000}/health >/dev/null"]

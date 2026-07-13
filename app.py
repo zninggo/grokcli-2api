@@ -54,7 +54,7 @@ import config as _config
 import history_compact
 from models import load_models_from_cache, resolve_model
 
-APP_VERSION = "1.9.46"
+APP_VERSION = "1.9.47"
 
 # Per-request usage context (client IP / path / UA) for request-level ledger rows.
 _usage_request_ctx: ContextVar[dict[str, Any] | None] = ContextVar(
@@ -5561,7 +5561,12 @@ def main() -> None:
     if reload_on:
         workers = 1
     else:
-        workers = max(2, int(WORKERS or 2))  # high-concurrency: never default to 1
+        # Honor explicit GROK2API_WORKERS (including 1) for low-RAM hosts.
+        # Unset / invalid still defaults to at least 2 via config._default_workers.
+        try:
+            workers = max(1, int(WORKERS or 2))
+        except (TypeError, ValueError):
+            workers = 2
     # On Linux servers / headless, don't auto-open browser by default
     default_open = "0" if (os.name != "nt" and not os.environ.get("DISPLAY") and not os.environ.get("WAYLAND_DISPLAY")) else "1"
     open_browser = os.getenv("GROK2API_OPEN_BROWSER", default_open) not in (
