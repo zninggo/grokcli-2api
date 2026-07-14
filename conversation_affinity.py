@@ -422,21 +422,29 @@ def bind_affinity(
     account_id: str | None,
     *,
     session_fp: str | None = None,
+    prompt_cache_key: str | None = None,
 ) -> None:
     """Pin conversation fingerprint to account after successful use.
 
     Optional ``session_fp`` is stored on the entry (used by response-chain
     links so later turns recover the multi-turn identity, not just the account).
+    Optional ``prompt_cache_key`` is stored so a later previous_response_id
+    lookup can recover the synthetic cache key for clients that never echo it.
     """
     if not fingerprint or not account_id or not _enabled():
         return
     sfp = (session_fp or "").strip() or None
+    pck = normalize_prompt_cache_key(prompt_cache_key)
     if _redis_mode():
         try:
             from store import affinity_redis
 
             affinity_redis.bind(
-                fingerprint, account_id, ttl_sec=_ttl(), session_fp=sfp
+                fingerprint,
+                account_id,
+                ttl_sec=_ttl(),
+                session_fp=sfp,
+                prompt_cache_key=pck,
             )
             return
         except Exception:
@@ -454,6 +462,8 @@ def bind_affinity(
             elif not prev.get("session_fp") and fingerprint.startswith("fp:"):
                 # Self-link when binding a session identity entry.
                 prev.setdefault("session_fp", fingerprint)
+            if pck:
+                prev["prompt_cache_key"] = pck
             _schedule_flush_locked()
             return
         entry = {
@@ -466,6 +476,10 @@ def bind_affinity(
             entry["session_fp"] = sfp
         elif prev and prev.get("session_fp"):
             entry["session_fp"] = prev.get("session_fp")
+        if pck:
+            entry["prompt_cache_key"] = pck
+        elif prev and prev.get("prompt_cache_key"):
+            entry["prompt_cache_key"] = prev.get("prompt_cache_key")
         _map[fingerprint] = entry
         _schedule_flush_locked()
 
@@ -700,18 +714,86 @@ def extract_prompt_cache_key_from_headers(headers: Any) -> str | None:
     return None
 
 
+def normalize_prompt_cache_key(value: Any) -> str | None:
+    """Sanitize a client or synthetic prompt_cache_key for sticky affinity."""
+    if value is None:
+        return None
+    s = str(value).strip()
+    if not s or s.lower() in ("null", "none", "undefined"):
+        return None
+    # Keep keys compact and log-safe; clients may pass long session URLs.
+    return s[:240]
+
+
+def mint_prompt_cache_key(
+    *,
+    api_key_id: str | None = None,
+    conversation_id: str | None = None,
+    previous_response_id: str | None = None,
+    user: str | None = None,
+    seed: str | None = None,
+) -> str:
+    """Mint a stable multi-turn prompt_cache_key when the client omitted one.
+
+    Priority of identity material:
+      1. conversation_id / session seed (already stable)
+      2. previous_response_id (ties into the Responses chain)
+      3. user id
+      4. random uuid (first turn only — subsequent turns should reuse the echo)
+
+    The returned key is namespaced so it will not collide with client keys.
+    """
+    import uuid
+
+    parts: list[str] = ["g2a"]
+    kid = (api_key_id or "").strip()
+    if kid:
+        parts.append(f"k{hashlib.sha256(kid.encode('utf-8')).hexdigest()[:10]}")
+
+    cid = (conversation_id or "").strip()
+    if cid:
+        parts.append(f"c{hashlib.sha256(cid.encode('utf-8')).hexdigest()[:16]}")
+        return "pck_" + hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:28]
+
+    seed_s = (seed or "").strip()
+    if seed_s:
+        parts.append(f"s{hashlib.sha256(seed_s.encode('utf-8')).hexdigest()[:16]}")
+        return "pck_" + hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:28]
+
+    prev = (previous_response_id or "").strip()
+    if prev:
+        # Deterministic from previous response so a client that only sends
+        # previous_response_id (no prompt_cache_key) still lands on one sticky key.
+        parts.append(f"p{hashlib.sha256(prev.encode('utf-8')).hexdigest()[:16]}")
+        return "pck_" + hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:28]
+
+    user_s = (user or "").strip()
+    if user_s and user_s.lower() not in ("user", "default", "anonymous", "string"):
+        parts.append(f"u{hashlib.sha256(user_s.encode('utf-8')).hexdigest()[:12]}")
+        return "pck_" + hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:28]
+
+    # Brand-new session with no sticky material: mint once; caller must echo it.
+    parts.append(f"n{uuid.uuid4().hex[:16]}")
+    return "pck_" + hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:28]
+
+
 def bind_response_chain(
     response_id: str | None,
     account_id: str | None,
     *,
     api_key_id: str | None = None,
     session_fp: str | None = None,
+    prompt_cache_key: str | None = None,
 ) -> None:
     """Pin an emitted Responses id so the next previous_response_id sticks.
 
     Also stores ``session_fp`` (the multi-turn conversation fingerprint) so the
     next turn can recover a stable sticky identity even when message roots
     churn. The session_fp entry itself is also refreshed on the account.
+
+    When ``prompt_cache_key`` is provided (often a server-minted key), it is
+    stored on the chain entry so a client that only sends previous_response_id
+    next turn still recovers the same synthetic cache key.
     """
     if not response_id or not account_id:
         return
@@ -719,11 +801,12 @@ def bind_response_chain(
     if not chain_fp:
         return
     sfp = (session_fp or "").strip() or None
-    # Link response_id → account + session_fp.
-    bind_affinity(chain_fp, account_id, session_fp=sfp)
+    pck = normalize_prompt_cache_key(prompt_cache_key)
+    # Link response_id → account + session_fp + optional pck.
+    bind_affinity(chain_fp, account_id, session_fp=sfp, prompt_cache_key=pck)
     # Keep the stable session identity warm so direct get_affinity(session_fp) works.
     if sfp:
-        bind_affinity(sfp, account_id, session_fp=sfp)
+        bind_affinity(sfp, account_id, session_fp=sfp, prompt_cache_key=pck)
 
 
 def get_response_chain_affinity(

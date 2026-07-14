@@ -2,14 +2,14 @@
 
 把 **Grok OIDC 登录态** 转成 **OpenAI / Anthropic 兼容 API**，并附带 Web 管理台：多 API Key、多账号轮询、设备码 / SSO / JSON 导入导出、协议注册。
 
-**当前版本：v1.9.69** · sub2api 终态帧修复 · 断联明细补全 · 上游模型入库
+**当前版本：v1.9.70** · 自动 prompt_cache_key · sub2api 终态帧 · 断联明细
 
 [![GHCR](https://img.shields.io/badge/ghcr.io-hm2899%2Fgrokcli--2api-blue)](https://github.com/users/HM2899/packages/container/package/grokcli-2api)
 [![Release](https://img.shields.io/github/v/release/HM2899/grokcli-2api?display_name=tag)](https://github.com/HM2899/grokcli-2api/releases)
 
 | 镜像（全小写） | 说明 |
 |----------------|------|
-| `ghcr.io/hm2899/grokcli-2api:1.9.69` | 当前版本 |
+| `ghcr.io/hm2899/grokcli-2api:1.9.70` | 当前版本 |
 | `ghcr.io/hm2899/grokcli-2api:latest` | 最近 `v*` tag |
 | `ghcr.io/hm2899/grokcli-2api:edge` | `main` 最新 |
 
@@ -139,7 +139,7 @@ ghcr.io/hm2899/grokcli-2api
 **正确示例：**
 
 ```bash
-docker pull ghcr.io/hm2899/grokcli-2api:1.9.69
+docker pull ghcr.io/hm2899/grokcli-2api:1.9.70
 # 或
 docker pull ghcr.io/hm2899/grokcli-2api:latest
 ```
@@ -178,7 +178,7 @@ services:
       retries: 10
 
   grokcli-2api:
-    image: ghcr.io/hm2899/grokcli-2api:1.9.69
+    image: ghcr.io/hm2899/grokcli-2api:1.9.70
     ports:
       # 只映射应用；不要给 postgres/redis 加 ports
       - "3000:3000"
@@ -416,7 +416,7 @@ gh run list --workflow=docker-publish.yml --limit 3
 成功后拉取（**必须小写**）：
 
 ```bash
-docker pull ghcr.io/hm2899/grokcli-2api:1.9.69
+docker pull ghcr.io/hm2899/grokcli-2api:1.9.70
 docker pull ghcr.io/hm2899/grokcli-2api:latest
 ```
 
@@ -457,7 +457,11 @@ docker-compose.yml                    # redis + postgres（内网）+ app
 
 ## 版本
 
-- **v1.9.69**（当前）
+- **v1.9.70**（当前）
+  - **自动 prompt_cache_key**：客户端未传时按 conversation / previous_response_id / session 生成稳定 key，并在响应 body/header 回传（`prompt_cache_key` / `X-Grok2API-Prompt-Cache-Key`）
+  - 响应链绑定保存 minted key，仅带 `previous_response_id` 的下一轮也能恢复同一 sticky key
+  - 继承 v1.9.69：sub2api 终态帧修复、空 200 冷却降敏
+- **v1.9.69**
   - **sub2api 终态帧修复**：`ResponsesLiveStreamer.complete()` 空结果不再 `_closed`，保证后续 `response.failed` + `[DONE]` 可发出，消除 sub2api `missing terminal event` / `upstream stream ended without terminal event`
   - **空 200 冷却降敏**：empty model output 只短冷却 8–20s，避免号池被打空后 sub2api 报 `no available accounts`
   - 推荐 sub2api 上游用 Docker 内网 `http://grokcli-2api:40081/v1`（避免重启瞬间公网 IP connection refused）
@@ -521,7 +525,7 @@ docker-compose.yml                    # redis + postgres（内网）+ app
 - **v1.9.45–1.9.38**：YYDS 域名、任务日志、JSON/SSO 进度、内联 hybrid 等
 - 更早变更见 [GitHub Releases](https://github.com/HM2899/grokcli-2api/releases)
 
-> 镜像 tag 与 `app.py` 中 `APP_VERSION` 一致（当前 **1.9.69**）。  
+> 镜像 tag 与 `app.py` 中 `APP_VERSION` 一致（当前 **1.9.70**）。  
 > 拉取路径固定 **`ghcr.io/hm2899/grokcli-2api`**（全小写）。
 
 ## License

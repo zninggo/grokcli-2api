@@ -20,6 +20,7 @@ def _parse_entry(raw: str | None) -> dict[str, Any] | None:
     hits = 0
     bound_at = time.time()
     session_fp: str | None = None
+    prompt_cache_key: str | None = None
     try:
         data = json.loads(raw)
         if isinstance(data, dict):
@@ -29,6 +30,9 @@ def _parse_entry(raw: str | None) -> dict[str, Any] | None:
             sfp = data.get("session_fp")
             if sfp:
                 session_fp = str(sfp)
+            pck = data.get("prompt_cache_key")
+            if pck:
+                prompt_cache_key = str(pck)
         else:
             account_id = str(raw)
     except (TypeError, ValueError, json.JSONDecodeError):
@@ -42,6 +46,8 @@ def _parse_entry(raw: str | None) -> dict[str, Any] | None:
     }
     if session_fp:
         out["session_fp"] = session_fp
+    if prompt_cache_key:
+        out["prompt_cache_key"] = prompt_cache_key
     return out
 
 
@@ -65,6 +71,9 @@ def get_entry(fingerprint: str, *, ttl_sec: float) -> dict[str, Any] | None:
     sfp = entry.get("session_fp")
     if sfp:
         payload["session_fp"] = sfp
+    pck = entry.get("prompt_cache_key")
+    if pck:
+        payload["prompt_cache_key"] = pck
     set_ex(_k(fingerprint), json.dumps(payload, separators=(",", ":")), ttl_sec)
     return payload
 
@@ -82,12 +91,14 @@ def bind(
     *,
     ttl_sec: float,
     session_fp: str | None = None,
+    prompt_cache_key: str | None = None,
 ) -> None:
     if not redis_enabled() or not fingerprint or not account_id:
         return
     now = time.time()
     prev_hits = 0
     prev_session: str | None = None
+    prev_pck: str | None = None
     prev_bound = now
     raw = get_str(_k(fingerprint))
     if raw:
@@ -95,9 +106,11 @@ def bind(
         if prev:
             prev_hits = int(prev.get("hits") or 0)
             prev_session = prev.get("session_fp")
+            prev_pck = prev.get("prompt_cache_key")
             if prev.get("account_id") == account_id:
                 prev_bound = float(prev.get("bound_at") or now)
     sfp = (session_fp or "").strip() or prev_session
+    pck = (prompt_cache_key or "").strip() or prev_pck
     payload: dict[str, Any] = {
         "account_id": account_id,
         "bound_at": prev_bound if (prev_hits and raw) else now,
@@ -111,6 +124,8 @@ def bind(
             payload["hits"] = int(prev.get("hits") or 0) + 1
     if sfp:
         payload["session_fp"] = sfp
+    if pck:
+        payload["prompt_cache_key"] = pck
     set_ex(_k(fingerprint), json.dumps(payload, separators=(",", ":")), ttl_sec)
 
 

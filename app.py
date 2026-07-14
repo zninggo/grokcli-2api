@@ -54,7 +54,7 @@ import config as _config
 import history_compact
 from models import load_models_from_cache, resolve_model
 
-APP_VERSION = "1.9.69"
+APP_VERSION = "1.9.70"
 
 # Per-request usage context (client IP / path / UA) for request-level ledger rows.
 _usage_request_ctx: ContextVar[dict[str, Any] | None] = ContextVar(
@@ -982,6 +982,7 @@ def _sanitize_upstream_body(body: dict[str, Any], *, model: str | None = None) -
     body.pop("_history_compact", None)
     body.pop("_prompt_stabilize", None)
     body.pop("_prompt_cache_key", None)
+    body.pop("_prompt_cache_key_minted", None)
     body.pop("_prompt_cache_retention", None)
     # Deprecated live-search knobs → 410 on current cli-chat-proxy builds.
     body.pop("search_parameters", None)
@@ -1444,6 +1445,12 @@ def _body_for_upstream(body: dict[str, Any]) -> dict[str, Any]:
     out = dict(body)
     out.pop("_history_compact", None)
     out.pop("_prompt_stabilize", None)
+    out.pop("_prompt_cache_key", None)
+    out.pop("_prompt_cache_key_minted", None)
+    out.pop("_prompt_cache_retention", None)
+    # OpenAI prompt-cache request fields are for sticky affinity / client echo only.
+    out.pop("prompt_cache_key", None)
+    out.pop("prompt_cache_retention", None)
     return out
 
 
@@ -1484,6 +1491,75 @@ def _prompt_stabilize_headers(body: dict[str, Any]) -> dict[str, str]:
         "X-Grok2API-Prompt-Stable": "1",
         "X-Grok2API-Prompt-Stable-Messages": str(stats.get("messages_stabilized") or 0),
         "X-Grok2API-Prompt-Stable-Tools": str(stats.get("tools_stabilized") or 0),
+    }
+
+
+def _ensure_prompt_cache_key(
+    *,
+    body: dict[str, Any] | None = None,
+    req: Any = None,
+    headers: Any = None,
+    api_key_id: str | None = None,
+    conversation_id: str | None = None,
+    previous_response_id: str | None = None,
+    user: str | None = None,
+    seed: str | None = None,
+) -> tuple[str | None, bool]:
+    """Return ``(prompt_cache_key, minted)``.
+
+    Prefer client-provided key (body / metadata / headers). When missing, mint a
+    stable key from conversation / previous_response_id / user so multi-turn
+    stickiness works for sub2api/Claude Code even without an explicit cache key.
+    The minted key is written onto ``body`` for later echo in responses.
+    """
+    pck = None
+    if isinstance(body, dict):
+        pck = conversation_affinity.normalize_prompt_cache_key(body.get("prompt_cache_key"))
+    if not pck and req is not None:
+        pck = conversation_affinity.extract_prompt_cache_key(req)
+    if not pck and headers is not None:
+        pck = conversation_affinity.extract_prompt_cache_key_from_headers(headers)
+    if pck:
+        if isinstance(body, dict):
+            body["prompt_cache_key"] = pck
+            body["_prompt_cache_key"] = pck
+            body["_prompt_cache_key_minted"] = False
+        return pck, False
+
+    minted = conversation_affinity.mint_prompt_cache_key(
+        api_key_id=api_key_id,
+        conversation_id=conversation_id,
+        previous_response_id=previous_response_id,
+        user=user,
+        seed=seed,
+    )
+    if isinstance(body, dict):
+        body["prompt_cache_key"] = minted
+        body["_prompt_cache_key"] = minted
+        body["_prompt_cache_key_minted"] = True
+    return minted, True
+
+
+def _prompt_cache_key_headers(
+    body: dict[str, Any] | None = None,
+    *,
+    prompt_cache_key: str | None = None,
+    minted: bool | None = None,
+) -> dict[str, str]:
+    """Echo the effective prompt_cache_key so clients can reuse it next turn."""
+    pck = prompt_cache_key
+    is_minted = minted
+    if isinstance(body, dict):
+        if not pck:
+            pck = body.get("_prompt_cache_key") or body.get("prompt_cache_key")
+        if is_minted is None:
+            is_minted = bool(body.get("_prompt_cache_key_minted"))
+    pck = conversation_affinity.normalize_prompt_cache_key(pck)
+    if not pck:
+        return {}
+    return {
+        "X-Grok2API-Prompt-Cache-Key": pck,
+        "X-Grok2API-Prompt-Cache-Key-Minted": "1" if is_minted else "0",
     }
 
 
@@ -1528,6 +1604,9 @@ def _attach_cache_debug_fields(
     usage: dict[str, Any] | None,
     *,
     prefer_account: bool | None = None,
+    prompt_cache_key: str | None = None,
+    prompt_cache_key_minted: bool | None = None,
+    body: dict[str, Any] | None = None,
 ) -> None:
     """Non-standard response fields so ops can see cache hits without log diving."""
     if not isinstance(result, dict):
@@ -1547,6 +1626,21 @@ def _attach_cache_debug_fields(
         result["x_grok2api_cache_hit_ratio"] = 0.0
     if prefer_account is not None:
         result["x_grok2api_affinity"] = bool(prefer_account)
+    pck = prompt_cache_key
+    minted = prompt_cache_key_minted
+    if isinstance(body, dict):
+        if not pck:
+            pck = body.get("_prompt_cache_key") or body.get("prompt_cache_key")
+        if minted is None and "_prompt_cache_key_minted" in body:
+            minted = bool(body.get("_prompt_cache_key_minted"))
+    pck = conversation_affinity.normalize_prompt_cache_key(pck)
+    if pck:
+        result["x_grok2api_prompt_cache_key"] = pck
+        # OpenAI-compatible echo so clients that read prompt_cache_key can reuse it.
+        if result.get("prompt_cache_key") in (None, ""):
+            result["prompt_cache_key"] = pck
+        if minted is not None:
+            result["x_grok2api_prompt_cache_key_minted"] = bool(minted)
 
 
 def _json_result_with_cache_headers(
@@ -1556,18 +1650,25 @@ def _json_result_with_cache_headers(
     prefer_account: bool | None = None,
     conv_fp: str | None = None,
     status_code: int = 200,
+    prompt_cache_key: str | None = None,
+    affinity_source: str | None = None,
 ) -> JSONResponse:
     """Wrap a successful non-stream result with affinity / cache / compact headers."""
     usage = result.get("usage") if isinstance(result, dict) else None
     headers: dict[str, str] = {}
     if prefer_account is not None:
         headers["X-Grok2API-Affinity"] = "1" if prefer_account else "0"
+    if affinity_source:
+        headers["X-Grok2API-Affinity-Source"] = str(affinity_source)
     if conv_fp:
         headers["X-Grok2API-Conversation-Fp"] = str(conv_fp)
     headers.update(_cache_debug_headers(usage if isinstance(usage, dict) else None))
     if isinstance(body, dict):
         headers.update(_history_compact_headers(body))
         headers.update(_prompt_stabilize_headers(body))
+        headers.update(_prompt_cache_key_headers(body, prompt_cache_key=prompt_cache_key))
+    elif prompt_cache_key:
+        headers.update(_prompt_cache_key_headers(prompt_cache_key=prompt_cache_key))
     return JSONResponse(content=result, status_code=status_code, headers=headers)
 
 
@@ -3376,21 +3477,28 @@ def _resolve_conversation_affinity(
     request: Request,
     *,
     api_key_id: str | None = None,
-) -> tuple[str | None, str | None]:
+    body: dict[str, Any] | None = None,
+) -> tuple[str | None, str | None, str | None, bool]:
     """
-    Returns (fingerprint, preferred_account_id).
+    Returns (fingerprint, preferred_account_id, prompt_cache_key, pck_minted).
     Same multi-turn chat → same fingerprint → sticky account
     (pool rotation will not switch accounts mid-conversation).
 
     Prefer prompt_cache_key when present so OpenAI/sub2api multi-turn stays on
-    one account for prompt-cache locality.
+    one account for prompt-cache locality. When the client omits it, mint one
+    so subsequent turns (or response echoes) can stick.
     """
     conv_id = conversation_affinity.extract_conversation_id_from_headers(
         request.headers
     ) or conversation_affinity.extract_conversation_id_from_body(req)
-    pck = conversation_affinity.extract_prompt_cache_key(
-        req
-    ) or conversation_affinity.extract_prompt_cache_key_from_headers(request.headers)
+    pck, minted = _ensure_prompt_cache_key(
+        body=body,
+        req=req,
+        headers=request.headers,
+        api_key_id=api_key_id,
+        conversation_id=conv_id,
+        user=getattr(req, "user", None),
+    )
     fp = conversation_affinity.conversation_fingerprint(
         req.messages,
         user=req.user,
@@ -3399,7 +3507,7 @@ def _resolve_conversation_affinity(
         prompt_cache_key=pck,
     )
     prefer = conversation_affinity.get_affinity(fp) if fp else None
-    return fp, prefer
+    return fp, prefer, pck, minted
 
 
 def _pick_account_chain(
@@ -3458,7 +3566,7 @@ async def chat_completions(
 
     key_id = _api_key_id(api_key)
     timing = RequestTiming(protocol="openai", stream=bool(req.stream))
-    conv_fp, prefer_account = await asyncio.to_thread(
+    conv_fp, prefer_account, pck, pck_minted = await asyncio.to_thread(
         _resolve_conversation_affinity, req, request, api_key_id=key_id
     )
     timing.mark_affinity(prefer_account)
@@ -3487,6 +3595,13 @@ async def chat_completions(
         timing.emit(ok=False, error=str(e))
         return _client_pool_error(e)
 
+    # Stamp auto/minted prompt_cache_key onto body for response echo (stripped
+    # before upstream by _sanitize_upstream_body / _body_for_upstream).
+    if isinstance(body, dict) and pck:
+        body["prompt_cache_key"] = pck
+        body["_prompt_cache_key"] = pck
+        body["_prompt_cache_key_minted"] = bool(pck_minted)
+
     _note_request_metrics(prefer_account=prefer_account, conv_fp=conv_fp)
 
     url = f"{UPSTREAM_BASE}/chat/completions"
@@ -3497,6 +3612,7 @@ async def chat_completions(
     compact_hdr = {
         **_history_compact_headers(body),
         **_prompt_stabilize_headers(body),
+        **_prompt_cache_key_headers(body, prompt_cache_key=pck, minted=pck_minted),
     }
     if req.stream:
         return StreamingResponse(
@@ -3608,7 +3724,12 @@ async def chat_completions(
             # non-standard but useful for multi-account / cache debugging
             result["x_grok2api_account"] = creds.email or creds.auth_key
             _attach_cache_debug_fields(
-                result, result.get("usage"), prefer_account=bool(prefer_account)
+                result,
+                result.get("usage"),
+                prefer_account=bool(prefer_account),
+                body=body,
+                prompt_cache_key=pck,
+                prompt_cache_key_minted=pck_minted,
             )
             hc_stats = body.get("_history_compact") if isinstance(body, dict) else None
             if isinstance(hc_stats, dict):
@@ -3621,6 +3742,7 @@ async def chat_completions(
                 body=body,
                 prefer_account=bool(prefer_account),
                 conv_fp=conv_fp,
+                prompt_cache_key=pck,
             )
         except httpx.HTTPStatusError as e:
             code = e.response.status_code if e.response is not None else 502
@@ -4704,8 +4826,12 @@ def _resolve_anthropic_affinity(
     request: Request,
     *,
     api_key_id: str | None = None,
-) -> tuple[str | None, str | None]:
-    """Fingerprint for sticky multi-turn on Anthropic-shaped requests."""
+    body: dict[str, Any] | None = None,
+) -> tuple[str | None, str | None, str | None, bool]:
+    """Fingerprint for sticky multi-turn on Anthropic-shaped requests.
+
+    Returns (fingerprint, preferred_account_id, prompt_cache_key, pck_minted).
+    """
     conv_id = conversation_affinity.extract_conversation_id_from_headers(
         request.headers
     )
@@ -4722,6 +4848,22 @@ def _resolve_anthropic_affinity(
     ) or conversation_affinity.extract_prompt_cache_key_from_headers(request.headers)
     if not pck:
         pck = anth.extract_anthropic_prompt_cache_key(req)
+    if pck:
+        pck = conversation_affinity.normalize_prompt_cache_key(pck)
+        minted = False
+        if isinstance(body, dict):
+            body["prompt_cache_key"] = pck
+            body["_prompt_cache_key"] = pck
+            body["_prompt_cache_key_minted"] = False
+    else:
+        pck, minted = _ensure_prompt_cache_key(
+            body=body,
+            req=req,
+            headers=request.headers,
+            api_key_id=api_key_id,
+            conversation_id=conv_id,
+            user=anth.metadata_user_id(req),
+        )
     fp = conversation_affinity.conversation_fingerprint(
         oa_msgs,
         user=anth.metadata_user_id(req),
@@ -4730,7 +4872,7 @@ def _resolve_anthropic_affinity(
         prompt_cache_key=pck,
     )
     prefer = conversation_affinity.get_affinity(fp) if fp else None
-    return fp, prefer
+    return fp, prefer, pck, minted
 
 
 def _anthropic_error_response(
@@ -4782,7 +4924,7 @@ async def anthropic_messages(
         )
 
     timing = RequestTiming(protocol="anthropic", stream=bool(req.stream))
-    conv_fp, prefer_account = await asyncio.to_thread(
+    conv_fp, prefer_account, pck, pck_minted = await asyncio.to_thread(
         _resolve_anthropic_affinity, req, request, api_key_id=key_id
     )
     timing.mark_affinity(prefer_account)
@@ -4840,9 +4982,15 @@ async def anthropic_messages(
     _note_request_metrics(prefer_account=prefer_account, conv_fp=conv_fp)
     url = f"{UPSTREAM_BASE}/chat/completions"
 
+    if isinstance(body, dict) and pck:
+        body["prompt_cache_key"] = pck
+        body["_prompt_cache_key"] = pck
+        body["_prompt_cache_key_minted"] = bool(pck_minted)
+
     compact_hdr = {
         **_history_compact_headers(body),
         **_prompt_stabilize_headers(body),
+        **_prompt_cache_key_headers(body, prompt_cache_key=pck, minted=pck_minted),
     }
     if req.stream:
         return StreamingResponse(
@@ -4954,6 +5102,9 @@ async def anthropic_messages(
                 result,
                 ledger_usage if isinstance(ledger_usage, dict) else usage,
                 prefer_account=bool(prefer_account),
+                body=body,
+                prompt_cache_key=pck,
+                prompt_cache_key_minted=pck_minted,
             )
             if conv_fp:
                 result["x_grok2api_conversation_fp"] = conv_fp
@@ -4963,6 +5114,7 @@ async def anthropic_messages(
                 body=body,
                 prefer_account=bool(prefer_account),
                 conv_fp=conv_fp,
+                prompt_cache_key=pck,
             )
         except httpx.HTTPStatusError as e:
             code = e.response.status_code if e.response is not None else 502
@@ -5064,10 +5216,10 @@ def _responses_affinity(
     request: Request,
     *,
     api_key_id: str | None = None,
-) -> tuple[str | None, str | None, str]:
+) -> tuple[str | None, str | None, str, str | None, bool]:
     """Sticky identity for OpenAI Responses multi-turn.
 
-    Returns ``(session_fp, prefer_account_id, source)``.
+    Returns ``(session_fp, prefer_account_id, source, prompt_cache_key, pck_minted)``.
 
     Priority (see conversation_affinity.resolve_responses_affinity):
       1. explicit conversation_id
@@ -5075,9 +5227,9 @@ def _responses_affinity(
       3. previous_response_id chain → linked session_fp + account
       4. user / message root fingerprint
 
-    Critical: when previous_response_id hits, the returned session_fp is the
-    *linked multi-turn identity*, not a fresh root hash. That keeps Claude Code
-    / sub2api on one account even when system/tools text churns every turn.
+    When the client omits prompt_cache_key, mint one from conversation_id /
+    previous_response_id so Claude Code / sub2api multi-turn still sticks and
+    the key can be echoed for the next turn.
     """
     conv_id = conversation_affinity.extract_conversation_id_from_headers(
         request.headers
@@ -5098,13 +5250,43 @@ def _responses_affinity(
     user = req_body.get("user")
     if not user and isinstance(req_body.get("metadata"), dict):
         user = req_body["metadata"].get("user")
-    pck = conversation_affinity.extract_prompt_cache_key(
-        req_body
-    ) or conversation_affinity.extract_prompt_cache_key_from_headers(request.headers)
     prev_id = req_body.get("previous_response_id")
+    prev_s = str(prev_id).strip() if prev_id else ""
+    # Recover a stable seed from the response chain so minted keys do not
+    # rotate every turn when clients only send previous_response_id.
+    seed = None
+    if prev_s and not conversation_affinity.extract_prompt_cache_key(req_body):
+        try:
+            entry = conversation_affinity.get_response_chain_entry(
+                prev_s, api_key_id=api_key_id
+            )
+            if entry:
+                seed = (entry.get("session_fp") or "").strip() or None
+                # Prefer an explicitly stored synthetic key when present.
+                stored = conversation_affinity.normalize_prompt_cache_key(
+                    entry.get("prompt_cache_key")
+                )
+                if stored:
+                    req_body["prompt_cache_key"] = stored
+                    req_body["_prompt_cache_key"] = stored
+                    req_body["_prompt_cache_key_minted"] = True
+        except Exception:
+            seed = None
+    # Mint / normalize prompt_cache_key onto req_body so resolve_* and later
+    # response echoes share the same value.
+    pck, minted = _ensure_prompt_cache_key(
+        body=req_body,
+        req=req_body,
+        headers=request.headers,
+        api_key_id=api_key_id,
+        conversation_id=conv_id,
+        previous_response_id=prev_s or None,
+        user=str(user) if user else None,
+        seed=seed,
+    )
     # Do NOT put previous_response_id into conversation_id — it changes every
     # turn and would shatter stickiness. Resolve it via response-chain binding.
-    return conversation_affinity.resolve_responses_affinity(
+    conv_fp, prefer, source = conversation_affinity.resolve_responses_affinity(
         messages,
         user=str(user) if user else None,
         conversation_id=conv_id,
@@ -5112,6 +5294,25 @@ def _responses_affinity(
         prompt_cache_key=pck,
         previous_response_id=str(prev_id) if prev_id else None,
     )
+    # If we only had previous_response_id (no client pck) and mint used prev id,
+    # re-key the sticky identity onto the minted pck fingerprint so future turns
+    # that only echo our X-Grok2API-Prompt-Cache-Key keep the same account.
+    if pck and conv_fp and source.startswith("previous_response_id"):
+        pck_fp = conversation_affinity.conversation_fingerprint(
+            messages,
+            user=str(user) if user else None,
+            conversation_id=None,
+            api_key_id=api_key_id,
+            prompt_cache_key=pck,
+        )
+        if pck_fp and prefer:
+            try:
+                conversation_affinity.bind_affinity(
+                    pck_fp, prefer, session_fp=conv_fp or pck_fp
+                )
+            except Exception:
+                pass
+    return conv_fp, prefer, source, pck, minted
 
 
 @app.post("/v1/responses")
@@ -5160,7 +5361,7 @@ async def openai_responses(
             err_type="invalid_request_error",
         )
 
-    conv_fp, prefer_account, affinity_source = await asyncio.to_thread(
+    conv_fp, prefer_account, affinity_source, pck, pck_minted = await asyncio.to_thread(
         _responses_affinity,
         body.get("messages") or [],
         req_body,
@@ -5200,9 +5401,21 @@ async def openai_responses(
 
     _note_request_metrics(prefer_account=prefer_account, conv_fp=conv_fp)
     url = f"{UPSTREAM_BASE}/chat/completions"
+    # Mirror minted/client prompt_cache_key onto the chat body for response echo.
+    if isinstance(body, dict) and pck:
+        body["prompt_cache_key"] = pck
+        body["_prompt_cache_key"] = pck
+        body["_prompt_cache_key_minted"] = bool(pck_minted)
+    elif isinstance(req_body, dict) and req_body.get("_prompt_cache_key"):
+        if isinstance(body, dict):
+            body["prompt_cache_key"] = req_body.get("_prompt_cache_key")
+            body["_prompt_cache_key"] = req_body.get("_prompt_cache_key")
+            body["_prompt_cache_key_minted"] = bool(req_body.get("_prompt_cache_key_minted"))
+
     compact_hdr = {
         **_history_compact_headers(body),
         **_prompt_stabilize_headers(body),
+        **_prompt_cache_key_headers(body, prompt_cache_key=pck, minted=pck_minted),
         "X-Grok2API-Affinity-Source": str(affinity_source or "none"),
     }
     prev_id = req_body.get("previous_response_id")
@@ -5256,6 +5469,7 @@ async def openai_responses(
                     creds.auth_key,
                     api_key_id=key_id,
                     session_fp=conv_fp,
+                    prompt_cache_key=pck,
                 )
                 return content, reasoning, finish, usage, tool_calls, creds
             except httpx.HTTPStatusError as e:
@@ -5463,6 +5677,7 @@ async def openai_responses(
                                         creds.auth_key,
                                         api_key_id=key_id,
                                         session_fp=conv_fp,
+                                        prompt_cache_key=pck,
                                     )
                                 )
 
@@ -5940,7 +6155,12 @@ async def openai_responses(
     )
     result["x_grok2api_account"] = creds.email or creds.auth_key
     _attach_cache_debug_fields(
-        result, ledger_usage, prefer_account=bool(prefer_account)
+        result,
+        ledger_usage,
+        prefer_account=bool(prefer_account),
+        body=body,
+        prompt_cache_key=pck,
+        prompt_cache_key_minted=pck_minted,
     )
     if conv_fp:
         result["x_grok2api_conversation_fp"] = conv_fp
@@ -5954,6 +6174,8 @@ async def openai_responses(
         body=body,
         prefer_account=bool(prefer_account),
         conv_fp=conv_fp,
+        prompt_cache_key=pck,
+        affinity_source=affinity_source,
     )
 
 
