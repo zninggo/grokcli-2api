@@ -54,7 +54,7 @@ import config as _config
 import history_compact
 from models import load_models_from_cache, resolve_model
 
-APP_VERSION = "1.9.65"
+APP_VERSION = "1.9.66"
 
 # Per-request usage context (client IP / path / UA) for request-level ledger rows.
 _usage_request_ctx: ContextVar[dict[str, Any] | None] = ContextVar(
@@ -365,9 +365,9 @@ def _on_startup() -> None:
         start_maintainers = True
 
     if start_maintainers:
-        # One-shot cleanup: permanently invalid refresh tokens leave rotation.
-        # Default is soft-disable (keep credentials). Hard delete only when
-        # GROK2API_DELETE_INVALID_REFRESH=1.
+        # One-shot cleanup: permanently invalid refresh tokens leave the pool.
+        # Default is hard-delete; set GROK2API_DELETE_INVALID_REFRESH=0 to
+        # soft-disable instead.
         try:
             from oidc_auth import purge_refresh_invalid_accounts
 

@@ -271,7 +271,7 @@ def run_once(*, force: bool = False) -> dict[str, Any]:
                 result["expired_cooldowns"] = {"ok": False, "error": str(e)[:200]}
             # Opportunistic cleanup of permanently unusable accounts:
             # refresh_invalid marks, no-RT+no-access, no-RT+access-expired.
-            # Default soft-disable (keep credentials); hard delete only with env.
+            # Default hard-delete; soft-disable only when env opts out.
             try:
                 from oidc_auth import purge_refresh_invalid_accounts
 
