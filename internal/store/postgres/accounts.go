@@ -66,7 +66,11 @@ func (c *Connector) ListAccountSummaries(ctx context.Context, page, pageSize int
 		       ap.enabled, ap.weight, ap.request_count, ap.success_count, ap.fail_count,
 		       ap.last_used_at, ap.last_error, ap.cooldown_until, ap.disabled_for_quota,
 		       ap.disabled_reason, ap.quota_disabled_at, ap.quota_source, ap.last_quota,
-		       ap.last_probe, ap.blocked_models
+		       ap.last_probe, ap.blocked_models,
+		       COALESCE(ap.pool_status, 'normal'), COALESCE(ap.cooldown_count, 0),
+		       ap.cooldown_reason, ap.cooldown_code, ap.cooldown_model,
+		       ap.cooldown_tokens_actual, ap.cooldown_tokens_limit,
+		       ap.last_probe_status, COALESCE(ap.extra, '{}'::jsonb)
 		FROM accounts a
 		LEFT JOIN account_pool ap ON ap.account_id = a.id ` + where + ` ORDER BY ` + orderBy + limitClause
 	rows, err := c.Pool.Query(ctx, sql, args...)
@@ -86,13 +90,26 @@ func (c *Connector) ListAccountSummaries(ctx context.Context, page, pageSize int
 		var weight *int
 		var requestCount, successCount, failCount *int64
 		var lastError, disabledReason, quotaSource *string
-		var lastQuota, lastProbe, blockedModels []byte
-		if err := rows.Scan(&id, &email, &userID, &teamID, &payloadBytes, &expiresAt, &updatedAt, &enabled, &weight, &requestCount, &successCount, &failCount, &lastUsedAt, &lastError, &cooldownUntil, &disabledForQuota, &disabledReason, &quotaDisabledAt, &quotaSource, &lastQuota, &lastProbe, &blockedModels); err != nil {
+		var lastQuota, lastProbe, blockedModels, extraBytes []byte
+		var poolStatus *string
+		var cooldownCount *int64
+		var cooldownReason, cooldownCode, cooldownModel, lastProbeStatus *string
+		var cooldownTokensActual, cooldownTokensLimit *int64
+		if err := rows.Scan(
+			&id, &email, &userID, &teamID, &payloadBytes, &expiresAt, &updatedAt,
+			&enabled, &weight, &requestCount, &successCount, &failCount,
+			&lastUsedAt, &lastError, &cooldownUntil, &disabledForQuota,
+			&disabledReason, &quotaDisabledAt, &quotaSource, &lastQuota,
+			&lastProbe, &blockedModels,
+			&poolStatus, &cooldownCount,
+			&cooldownReason, &cooldownCode, &cooldownModel,
+			&cooldownTokensActual, &cooldownTokensLimit,
+			&lastProbeStatus, &extraBytes,
+		); err != nil {
 			return AccountList{}, err
 		}
-		_ = lastQuota
-		_ = lastProbe
 		payload := decodeMap(payloadBytes)
+		extra := decodeMap(extraBytes)
 		token, _ := firstString(payload, "key", "access_token", "token")
 		expired := expiresAt != nil && now.After(*expiresAt)
 		poolEnabled := true
@@ -107,7 +124,67 @@ func (c *Connector) ListAccountSummaries(ctx context.Context, page, pageSize int
 		if disabledForQuota != nil {
 			quotaDisabled = *disabledForQuota
 		}
-		blocked := decodeMap(blockedModels)
+		blocked := activeBlockedModels(decodeMap(blockedModels), now)
+		cdRemain := cooldownRemaining(now, cooldownUntil)
+		cdCount := int64OrZero(cooldownCount)
+		statusStack := statusStackFromExtra(extra)
+		if cdCount <= 0 && len(statusStack) > 0 {
+			cdCount = int64(len(statusStack))
+		}
+		// Count-based cooling (Python parity) OR wall-clock cooldown_until.
+		inCooldown := cdRemain > 0 || cdCount > 0 || len(statusStack) > 0
+		rawStatus := ""
+		if poolStatus != nil {
+			rawStatus = strings.TrimSpace(*poolStatus)
+		}
+		status := derivePoolStatus(map[string]any{
+			"pool_status":        rawStatus,
+			"enabled":            poolEnabled,
+			"disabled_for_quota": quotaDisabled,
+			"in_cooldown":        inCooldown,
+			"blocked_model_ids":  mapKeys(blocked),
+			"expired":            expired,
+			"last_renew_status":  stringFromMap(extra, "last_renew_status"),
+			"token_expired_at":   extra["token_expired_at"],
+		})
+		pool := map[string]any{
+			"id":                     id,
+			"enabled":                poolEnabled,
+			"weight":                 poolWeight,
+			"request_count":          int64OrZero(requestCount),
+			"success_count":          int64OrZero(successCount),
+			"fail_count":             int64OrZero(failCount),
+			"last_used_at":           unixOrNil(lastUsedAt),
+			"last_error":             stringPtr(lastError),
+			"cooldown_until":         unixOrNil(cooldownUntil),
+			"cooldown_remaining_sec": cdRemain,
+			"cooldown_count":         cdCount,
+			"cooldown_reason":        stringPtr(cooldownReason),
+			"cooldown_code":          stringPtr(cooldownCode),
+			"cooldown_model":         stringPtr(cooldownModel),
+			"cooldown_tokens_actual": int64PtrOrNil(cooldownTokensActual),
+			"cooldown_tokens_limit":  int64PtrOrNil(cooldownTokensLimit),
+			"in_cooldown":            inCooldown,
+			"disabled_for_quota":     quotaDisabled,
+			"disabled_reason":        stringPtr(disabledReason),
+			"quota_disabled_at":      unixOrNil(quotaDisabledAt),
+			"quota_source":           stringPtr(quotaSource),
+			"last_quota":             decodeMap(lastQuota),
+			"last_probe":             decodeMap(lastProbe),
+			"last_probe_status":      stringPtr(lastProbeStatus),
+			"blocked_models":         blocked,
+			"blocked_model_ids":      mapKeys(blocked),
+			"pool_status":            status,
+			"status_stack":           statusStack,
+			"consecutive_fails":      intFromMap(extra, "consecutive_fails"),
+			"probe_fail_streak":      intFromMap(extra, "probe_fail_streak"),
+			"token_expired_at":       extra["token_expired_at"],
+			"token_expired_reason":   stringFromMap(extra, "token_expired_reason"),
+			"renew_fail_count":       intFromMap(extra, "renew_fail_count"),
+			"last_renew_error":       stringFromMap(extra, "last_renew_error"),
+			"last_renew_status":      stringFromMap(extra, "last_renew_status"),
+			"last_renew_source":      stringFromMap(extra, "last_renew_source"),
+		}
 		accounts = append(accounts, map[string]any{
 			"id":                id,
 			"email":             firstNonNilString(email, stringFromMap(payload, "email")),
@@ -125,26 +202,8 @@ func (c *Connector) ListAccountSummaries(ctx context.Context, page, pageSize int
 			"last_name":         payload["last_name"],
 			"principal_type":    payload["principal_type"],
 			"source":            payload["source"],
-			"_pool": map[string]any{
-				"id":                     id,
-				"enabled":                poolEnabled,
-				"weight":                 poolWeight,
-				"request_count":          int64OrZero(requestCount),
-				"success_count":          int64OrZero(successCount),
-				"fail_count":             int64OrZero(failCount),
-				"last_used_at":           unixOrNil(lastUsedAt),
-				"last_error":             stringPtr(lastError),
-				"cooldown_until":         unixOrNil(cooldownUntil),
-				"cooldown_remaining_sec": cooldownRemaining(now, cooldownUntil),
-				"in_cooldown":            cooldownRemaining(now, cooldownUntil) > 0,
-				"disabled_for_quota":     quotaDisabled,
-				"disabled_reason":        stringPtr(disabledReason),
-				"quota_disabled_at":      unixOrNil(quotaDisabledAt),
-				"quota_source":           stringPtr(quotaSource),
-				"last_quota":             decodeMap(lastQuota),
-				"last_probe":             decodeMap(lastProbe),
-				"blocked_model_ids":      mapKeys(blocked),
-			}})
+			"_pool":             pool,
+		})
 	}
 	if err := rows.Err(); err != nil {
 		return AccountList{}, err
@@ -270,6 +329,145 @@ func hasSSO(payload map[string]any) bool {
 		}
 	}
 	return false
+}
+
+// activeBlockedModels drops expired soft blocks (until < now) so the UI does
+// not keep showing "模型封禁" after TTL.
+func activeBlockedModels(blocked map[string]any, now time.Time) map[string]any {
+	if len(blocked) == 0 {
+		return map[string]any{}
+	}
+	out := make(map[string]any, len(blocked))
+	nowUnix := float64(now.Unix())
+	for mid, entry := range blocked {
+		if m, ok := entry.(map[string]any); ok {
+			if until, ok := m["until"]; ok && until != nil {
+				var u float64
+				switch v := until.(type) {
+				case float64:
+					u = v
+				case float32:
+					u = float64(v)
+				case int:
+					u = float64(v)
+				case int64:
+					u = float64(v)
+				case json.Number:
+					u, _ = v.Float64()
+				case string:
+					if f, err := strconv.ParseFloat(v, 64); err == nil {
+						u = f
+					}
+				}
+				// Support both unix seconds and ms.
+				if u > 1e12 {
+					u = u / 1000
+				}
+				if u > 0 && nowUnix >= u {
+					continue
+				}
+			}
+		}
+		out[mid] = entry
+	}
+	return out
+}
+
+func derivePoolStatus(fields map[string]any) string {
+	status := ""
+	if v, ok := fields["pool_status"]; ok {
+		switch t := v.(type) {
+		case string:
+			status = strings.ToLower(strings.TrimSpace(t))
+		case *string:
+			if t != nil {
+				status = strings.ToLower(strings.TrimSpace(*t))
+			}
+		}
+	}
+	renew := ""
+	if v, ok := fields["last_renew_status"].(string); ok {
+		renew = strings.ToLower(strings.TrimSpace(v))
+	}
+	expired, _ := fields["expired"].(bool)
+	if status == "expired" || expired ||
+		renew == "failed" || renew == "expired" || renew == "sso_failed" ||
+		renew == "no_sso_removed" || renew == "no_sso_deleted" || renew == "sso_attempt" {
+		return "expired"
+	}
+	if fields["token_expired_at"] != nil && status == "" {
+		return "expired"
+	}
+	if quota, _ := fields["disabled_for_quota"].(bool); quota || status == "quota_disabled" {
+		return "quota_disabled"
+	}
+	enabled := true
+	if v, ok := fields["enabled"].(bool); ok {
+		enabled = v
+	}
+	if !enabled || status == "disabled" {
+		return "disabled"
+	}
+	if cooling, _ := fields["in_cooldown"].(bool); cooling || status == "cooldown" {
+		return "cooldown"
+	}
+	if ids, ok := fields["blocked_model_ids"].([]string); ok && len(ids) > 0 {
+		return "model_blocked"
+	}
+	if status == "model_blocked" {
+		return "model_blocked"
+	}
+	if status != "" {
+		return status
+	}
+	return "normal"
+}
+
+func statusStackFromExtra(extra map[string]any) []any {
+	if extra == nil {
+		return []any{}
+	}
+	raw, ok := extra["status_stack"]
+	if !ok || raw == nil {
+		return []any{}
+	}
+	switch v := raw.(type) {
+	case []any:
+		return v
+	default:
+		return []any{}
+	}
+}
+
+func intFromMap(m map[string]any, key string) int64 {
+	if m == nil {
+		return 0
+	}
+	switch v := m[key].(type) {
+	case float64:
+		return int64(v)
+	case float32:
+		return int64(v)
+	case int:
+		return int64(v)
+	case int64:
+		return v
+	case json.Number:
+		n, _ := v.Int64()
+		return n
+	case string:
+		n, _ := strconv.ParseInt(v, 10, 64)
+		return n
+	default:
+		return 0
+	}
+}
+
+func int64PtrOrNil(ptr *int64) any {
+	if ptr == nil {
+		return nil
+	}
+	return *ptr
 }
 
 func mapKeys(value map[string]any) []string {

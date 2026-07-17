@@ -11,6 +11,9 @@ import (
 )
 
 func (c *Connector) ListPoolCandidates(ctx context.Context) ([]pool.Candidate, error) {
+	// Hot path: only load a small eligible window instead of the full pool.
+	// Token is required and must not be expired/cooldown/disabled. LIMIT keeps
+	// picker work and JSON payload decode cheap while preserving least_used order.
 	rows, err := c.Pool.Query(ctx, `
 		SELECT a.id, a.payload, a.email, a.user_id, a.team_id, a.expires_at,
 		       COALESCE(ap.enabled, true), COALESCE(ap.disabled_for_quota, false),
@@ -18,7 +21,17 @@ func (c *Connector) ListPoolCandidates(ctx context.Context) ([]pool.Candidate, e
 		       COALESCE(ap.request_count, 0), COALESCE(ap.weight, 1)
 		FROM accounts a
 		LEFT JOIN account_pool ap ON ap.account_id = a.id
-		ORDER BY COALESCE(ap.weight, 1) DESC, COALESCE(ap.request_count, 0) ASC, a.id ASC`)
+		WHERE COALESCE(ap.enabled, true) = true
+		  AND COALESCE(ap.disabled_for_quota, false) = false
+		  AND (ap.cooldown_until IS NULL OR ap.cooldown_until <= now())
+		  AND (a.expires_at IS NULL OR a.expires_at > now())
+		  AND (
+		        COALESCE(a.payload->>'key', '') <> ''
+		     OR COALESCE(a.payload->>'access_token', '') <> ''
+		     OR COALESCE(a.payload->>'token', '') <> ''
+		  )
+		ORDER BY COALESCE(ap.weight, 1) DESC, COALESCE(ap.request_count, 0) ASC, a.id ASC
+		LIMIT 64`)
 	if err != nil {
 		return nil, err
 	}
@@ -354,17 +367,20 @@ func (c *Connector) GetAccountPoolView(ctx context.Context, accountID string) (m
 		return nil, err
 	}
 	now := time.Now()
-	inCooldown := cooldownUntil != nil && cooldownUntil.After(now)
-	status := "normal"
+	inCooldown := cooldownUntil != nil && cooldownUntil.After(now) || cooldownCount > 0
+	rawStatus := "normal"
 	if poolStatus != nil && strings.TrimSpace(*poolStatus) != "" {
-		status = strings.TrimSpace(*poolStatus)
+		rawStatus = strings.TrimSpace(*poolStatus)
 	}
-	if !enabled || disabledForQuota {
-		status = "disabled"
-	} else if inCooldown {
-		status = "cooldown"
-	}
-	blocked := decodeMap(blockedBytes)
+	blocked := activeBlockedModels(decodeMap(blockedBytes), now)
+	status := derivePoolStatus(map[string]any{
+		"pool_status":        rawStatus,
+		"enabled":            enabled,
+		"disabled_for_quota": disabledForQuota,
+		"in_cooldown":        inCooldown,
+		"blocked_model_ids":  mapKeys(blocked),
+		"expired":            expiresAt != nil && now.After(*expiresAt),
+	})
 	out := map[string]any{
 		"id":                     id,
 		"email":                  stringPtr(email),
@@ -398,4 +414,16 @@ func maxFloat(v, min float64) float64 {
 		return min
 	}
 	return v
+}
+
+func (c *Connector) CountEnabledAccounts(ctx context.Context) (int64, error) {
+	var n int64
+	err := c.Pool.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM accounts a
+		LEFT JOIN account_pool ap ON ap.account_id = a.id
+		WHERE COALESCE(ap.enabled, true) = true
+		  AND COALESCE(ap.disabled_for_quota, false) = false
+	`).Scan(&n)
+	return n, err
 }

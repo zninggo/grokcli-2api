@@ -1333,49 +1333,7 @@ function renderAccountsPage() {
     tbody.innerHTML = pageItems.map((a) => {
       const p = a._pool || { id: a.id };
       const enabled = p.enabled !== false;
-      const stackLen = Array.isArray(p.status_stack) ? p.status_stack.length : 0;
-      const cdCount = Number(p.cooldown_count || stackLen || 0) || 0;
-      const cooling = !!(p.in_cooldown || cdCount > 0 || stackLen > 0 || p.pool_status === "cooldown");
-      const quotaOff = p.disabled_for_quota;
-      const expired = !!(
-        p.pool_status === "expired"
-        || a.expired
-        || p.token_expired_at
-        || ["failed","expired","sso_failed","no_sso_removed","no_sso_deleted","sso_attempt"].includes(String(p.last_renew_status || ""))
-      );
-      const renewFails = Number(p.renew_fail_count || 0) || 0;
-      const streak = Number(p.consecutive_fails || 0) || 0;
-      const cdCode = p.cooldown_code || "";
-      const cdModel = p.cooldown_model || "";
-      const cdTok = (p.cooldown_tokens_actual != null && p.cooldown_tokens_limit != null)
-        ? `${p.cooldown_tokens_actual}/${p.cooldown_tokens_limit}` : "";
-      let poolLabel;
-      if (quotaOff) poolLabel = '<span class="g2a-tag bad">额度禁用</span>';
-      else if (expired) {
-        const tip = [
-          "已过期，已移出轮询",
-          renewFails ? `续期失败×${renewFails}` : "",
-          p.last_renew_error || p.token_expired_reason || p.last_error || "",
-          p.last_renew_status === "no_sso_removed" || p.last_renew_status === "no_sso_deleted" ? "无 SSO，续不上 AT 已删除" : "",
-          p.last_renew_status === "sso_failed" ? "SSO 重登失败" : "",
-        ].filter(Boolean).join(" · ");
-        poolLabel = `<span class="g2a-tag bad" title="${esc(tip)}">过期</span>`;
-      }
-      else if (!enabled) poolLabel = '<span class="g2a-tag bad">已禁用</span>';
-      else if (cooling) {
-        const n = cdCount > 0 ? cdCount : 1;
-        const tip = [
-          "冷却中",
-          n > 1 ? `叠加×${n}` : "",
-          cdCode ? `code=${cdCode}` : "",
-          cdModel ? `model=${cdModel}` : "",
-          cdTok ? `tokens ${cdTok}` : "",
-          "单次测活成功即恢复正常",
-        ].filter(Boolean).join(" · ");
-        poolLabel = `<span class="g2a-tag warn" title="${esc(tip)}">冷却中</span>`;
-      }
-      else if (streak >= 2) poolLabel = `<span class="g2a-tag warn">轮询中 · 连败${streak}</span>`;
-      else poolLabel = '<span class="g2a-tag ok">轮询中</span>';
+      const poolLabel = poolStatusLabel(a, p);
       const usage = `${p.success_count || 0}√ / ${p.fail_count || 0}× · 共 ${p.request_count || 0}`;
       const refreshPill = a.has_refresh_token
         ? '<span class="g2a-tag ok" title="可自动 refresh">可自动续期</span>'
@@ -1602,35 +1560,7 @@ function renderOneAccountRow(account) {
   const a = account;
   const p = a._pool || { id: a.id };
   const enabled = p.enabled !== false;
-  const stackLen = Array.isArray(p.status_stack) ? p.status_stack.length : 0;
-  const cdCount = Number(p.cooldown_count || stackLen || 0) || 0;
-  const cooling = !!(p.in_cooldown || cdCount > 0 || stackLen > 0 || p.pool_status === "cooldown");
-  const quotaOff = p.disabled_for_quota;
-  const expired = !!(
-    p.pool_status === "expired"
-    || a.expired
-    || p.token_expired_at
-    || ["failed","expired","sso_failed","no_sso_removed","no_sso_deleted","sso_attempt"].includes(String(p.last_renew_status || ""))
-  );
-  const renewFails = Number(p.renew_fail_count || 0) || 0;
-  let poolLabel;
-  if (quotaOff) poolLabel = '<span class="g2a-tag bad">额度禁用</span>';
-  else if (expired) {
-    const tip = [
-      "已过期，已移出轮询",
-      renewFails ? `续期失败×${renewFails}` : "",
-      p.last_renew_error || p.token_expired_reason || p.last_error || "",
-      p.last_renew_status === "no_sso_removed" || p.last_renew_status === "no_sso_deleted" ? "无 SSO，续不上 AT 已删除" : "",
-    ].filter(Boolean).join(" · ");
-    poolLabel = `<span class="g2a-tag bad" title="${esc(tip)}">过期</span>`;
-  }
-  else if (!enabled) poolLabel = '<span class="g2a-tag bad">已禁用</span>';
-  else if (cooling) {
-    const n = cdCount > 0 ? cdCount : 1;
-    const tip = n > 1 ? `冷却中 · 叠加×${n} · 单次测活成功即恢复` : "冷却中 · 单次测活成功即恢复";
-    poolLabel = `<span class="g2a-tag warn" title="${esc(tip)}">冷却中</span>`;
-  }
-  else poolLabel = '<span class="g2a-tag ok">轮询中</span>';
+  const poolLabel = poolStatusLabel(a, p);
   const usage = `${p.success_count || 0}√ / ${p.fail_count || 0}× · 共 ${p.request_count || 0}`;
   const refreshPill = a.has_refresh_token
     ? '<span class="g2a-tag ok" title="可自动 refresh">可自动续期</span>'
@@ -2027,9 +1957,85 @@ if ($("acc-check-page")) {
   on("acc-check-page", "onchange", (e) => setPageSelection(!!e.target.checked));
 }
 
+function poolStatusLabel(a, p) {
+  const enabled = p.enabled !== false;
+  const stackLen = Array.isArray(p.status_stack) ? p.status_stack.length : 0;
+  const cdCount = Number(p.cooldown_count || stackLen || 0) || 0;
+  const cooling = !!(p.in_cooldown || cdCount > 0 || stackLen > 0 || p.pool_status === "cooldown");
+  const quotaOff = !!p.disabled_for_quota || p.pool_status === "quota_disabled";
+  const blockedIds = Array.isArray(p.blocked_model_ids)
+    ? p.blocked_model_ids
+    : (p.blocked_models && typeof p.blocked_models === "object" ? Object.keys(p.blocked_models) : []);
+  const modelBlocked = blockedIds.length > 0 || p.pool_status === "model_blocked";
+  const expired = !!(
+    p.pool_status === "expired"
+    || a.expired
+    || p.token_expired_at
+    || ["failed","expired","sso_failed","no_sso_removed","no_sso_deleted","sso_attempt"].includes(String(p.last_renew_status || ""))
+  );
+  const renewFails = Number(p.renew_fail_count || 0) || 0;
+  const streak = Number(p.consecutive_fails || 0) || 0;
+  const cdCode = p.cooldown_code || "";
+  const cdModel = p.cooldown_model || "";
+  const cdTok = (p.cooldown_tokens_actual != null && p.cooldown_tokens_limit != null)
+    ? `${p.cooldown_tokens_actual}/${p.cooldown_tokens_limit}` : "";
+  let poolLabel;
+  if (quotaOff) {
+    const tip = [p.disabled_reason || "额度耗尽，已移出轮询", p.quota_source ? `source=${p.quota_source}` : ""].filter(Boolean).join(" · ");
+    poolLabel = `<span class="g2a-tag bad" title="${esc(tip)}">额度禁用</span>`;
+  } else if (expired) {
+    const tip = [
+      "已过期，已移出轮询",
+      renewFails ? `续期失败×${renewFails}` : "",
+      p.last_renew_error || p.token_expired_reason || p.last_error || "",
+      p.last_renew_status === "no_sso_removed" || p.last_renew_status === "no_sso_deleted" ? "无 SSO，续不上 AT 已删除" : "",
+      p.last_renew_status === "sso_failed" ? "SSO 重登失败" : "",
+    ].filter(Boolean).join(" · ");
+    poolLabel = `<span class="g2a-tag bad" title="${esc(tip)}">过期</span>`;
+  } else if (!enabled || p.pool_status === "disabled") {
+    const tip = p.disabled_reason || p.last_error || "已禁用，不参与轮询";
+    poolLabel = `<span class="g2a-tag bad" title="${esc(tip)}">已禁用</span>`;
+  } else if (cooling) {
+    const n = cdCount > 0 ? cdCount : 1;
+    const tip = [
+      "冷却中",
+      n > 1 ? `叠加×${n}` : "",
+      cdCode ? `code=${cdCode}` : "",
+      cdModel ? `model=${cdModel}` : "",
+      cdTok ? `tokens ${cdTok}` : "",
+      "单次测活成功即恢复正常",
+    ].filter(Boolean).join(" · ");
+    poolLabel = `<span class="g2a-tag warn" title="${esc(tip)}">冷却中</span>`;
+  } else if (modelBlocked) {
+    const tip = [
+      "模型封禁（账号仍可轮询其他模型）",
+      blockedIds.length ? blockedIds.join(", ") : "",
+      p.last_error || "",
+    ].filter(Boolean).join(" · ");
+    const short = blockedIds.length <= 2
+      ? blockedIds.join(",")
+      : `${blockedIds.slice(0, 2).join(",")}…+${blockedIds.length - 2}`;
+    poolLabel = `<span class="g2a-tag warn" title="${esc(tip)}">模型封禁${short ? " · " + esc(short) : ""}</span>`;
+  } else if (streak >= 2) {
+    poolLabel = `<span class="g2a-tag warn">轮询中 · 连败${streak}</span>`;
+  } else {
+    poolLabel = '<span class="g2a-tag ok">轮询中</span>';
+  }
+  return poolLabel;
+}
+
 function fmtProbeCell(lastProbe, lastError, blockedIds) {
+  const ids = Array.isArray(blockedIds) ? blockedIds.filter(Boolean) : [];
+  const blocked = ids.length
+    ? `<div class="g2a-tag warn" title="${esc("模型封禁: " + ids.join(", "))}" style="margin-top:4px">屏蔽 ${esc(ids.length <= 2 ? ids.join(", ") : ids.slice(0, 2).join(", ") + "…")}</div>`
+    : "";
   const lp = lastProbe || null;
   if (!lp) {
+    if (blocked) {
+      return blocked + (lastError
+        ? `<div class="g2a-muted" title="${esc(lastError)}" style="max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(String(lastError).slice(0, 48))}</div>`
+        : "");
+    }
     const err = lastError
       ? `<div class="g2a-muted" title="${esc(lastError)}" style="max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(String(lastError).slice(0, 48))}</div>`
       : '<span class="g2a-muted">未探测</span>';
@@ -2039,9 +2045,6 @@ function fmtProbeCell(lastProbe, lastError, blockedIds) {
   const pill = ok ? '<span class="g2a-tag ok">正常</span>' : '<span class="g2a-tag bad">报错</span>';
   const model = lp.model ? `<span class="mono">${esc(lp.model)}</span>` : "";
   const when = lp.probed_at ? fmtTime(lp.probed_at) : "";
-  const blocked = (blockedIds && blockedIds.length)
-    ? `<div class="g2a-muted">屏蔽: ${esc(blockedIds.join(", "))}</div>`
-    : "";
   const err = (!ok && lp.error)
     ? `<div class="g2a-muted" title="${esc(lp.error)}" style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(String(lp.error).slice(0, 60))}</div>`
     : "";
