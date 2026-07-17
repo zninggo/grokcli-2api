@@ -30,6 +30,7 @@ import (
 	"github.com/hm2899/grokcli-2api/internal/models"
 	"github.com/hm2899/grokcli-2api/internal/pool"
 	"github.com/hm2899/grokcli-2api/internal/protocol/anthropic"
+	"github.com/hm2899/grokcli-2api/internal/protocol/historycompact"
 	"github.com/hm2899/grokcli-2api/internal/protocol/responses"
 	"github.com/hm2899/grokcli-2api/internal/proxy"
 	"github.com/hm2899/grokcli-2api/internal/quota"
@@ -54,10 +55,13 @@ type Options struct {
 	Store             *postgres.Connector
 	// Candidates, when non-empty, is used by proxy routes instead of Store.ListPoolCandidates.
 	// Intended for contract/e2e tests against a fake upstream.
-	Candidates        []pool.Candidate
-	AdminSessions     admin.SessionVerifier
-	PickObserver      proxy.PickObserver
-	AffinityStore     proxy.AffinityStore
+	Candidates    []pool.Candidate
+	AdminSessions admin.SessionVerifier
+	PickObserver  proxy.PickObserver
+	AffinityStore proxy.AffinityStore
+	// Upstream is a shared Grok HTTP client (connection pool). Prefer this over
+	// constructing a new client on every request.
+	Upstream          *grok.Client
 	Redis             *redis.Client
 	Leader            *redis.Leader
 	Maintainer        *maintainer.Service
@@ -470,7 +474,7 @@ func serveChatCompletions(w http.ResponseWriter, r *http.Request, options Option
 	}
 	service := proxy.ChatService{
 		Catalog:       modelCatalog(options),
-		Client:        &grok.Client{BaseURL: options.Config.UpstreamBase},
+		Client:        upstreamClient(options),
 		PickObserver:  options.PickObserver,
 		AffinityStore: options.AffinityStore,
 	}
@@ -741,14 +745,23 @@ func serveMessages(w http.ResponseWriter, r *http.Request, options Options) {
 	}
 	service := proxy.ChatService{
 		Catalog:       modelCatalog(options),
-		Client:        &grok.Client{BaseURL: options.Config.UpstreamBase},
+		Client:        upstreamClient(options),
 		PickObserver:  options.PickObserver,
 		AffinityStore: options.AffinityStore,
 	}
 	started := time.Now()
 	messageID := newAnthropicMessageID()
-	// Match Python default for Claude Code: at most one outbound tool_use block.
-	maxTools := options.Config.OutboundMaxTools
+	// Match Python resolve_outbound_max_tools for anthropic (Claude/sub2api-safe).
+	policy := historycompact.ResolveOutboundToolPolicy(
+		"anthropic",
+		r.UserAgent(),
+		options.Config.OutboundMaxTools,
+		options.Config.OutboundMaxToolsOpenAI,
+		options.Config.OutboundMaxToolsResponsesNative,
+		options.Config.OutboundToolGap,
+		options.Config.OutboundToolGapNative,
+	)
+	maxTools := policy.MaxTools
 	if maxTools < 0 {
 		maxTools = 0
 	}
@@ -765,6 +778,9 @@ func serveMessages(w http.ResponseWriter, r *http.Request, options Options) {
 		req := r
 		if options.Config.SSEKeepalive > 0 {
 			req = r.WithContext(withAnthropicKeepalive(r.Context(), options.Config.SSEKeepalive))
+		}
+		if policy.ToolGap > 0 {
+			req = req.WithContext(withOutboundToolGap(req.Context(), policy.ToolGap))
 		}
 		setAnthropicObservationHeaders(w, protocolObservation{Protocol: "anthropic",
 			AccountID: opened.AccountID, PreferAccount: opened.PreferAccount, Failover: opened.Failover,
@@ -921,10 +937,19 @@ func serveResponses(w http.ResponseWriter, r *http.Request, options Options) {
 		writeOpenAIError(w, http.StatusInternalServerError, err.Error(), "server_error")
 		return
 	}
-	service := proxy.ChatService{Catalog: modelCatalog(options), Client: &grok.Client{BaseURL: options.Config.UpstreamBase}, PickObserver: options.PickObserver, AffinityStore: options.AffinityStore}
+	service := proxy.ChatService{Catalog: modelCatalog(options), Client: upstreamClient(options), PickObserver: options.PickObserver, AffinityStore: options.AffinityStore}
 	started := time.Now()
 	responseID := responses.NewResponseID()
 	chatReq := proxy.ChatRequest{Model: model, Stream: stream, Raw: body}
+	respPolicy := historycompact.ResolveOutboundToolPolicy(
+		"openai_responses",
+		r.UserAgent(),
+		options.Config.OutboundMaxTools,
+		options.Config.OutboundMaxToolsOpenAI,
+		options.Config.OutboundMaxToolsResponsesNative,
+		options.Config.OutboundToolGap,
+		options.Config.OutboundToolGapNative,
+	)
 	if stream {
 		opened, err := service.OpenStreamWithResult(r.Context(), chatReq, candidates, "least_used")
 		if err != nil {
@@ -938,11 +963,14 @@ func serveResponses(w http.ResponseWriter, r *http.Request, options Options) {
 		if options.Config.SSEKeepalive > 0 {
 			req = r.WithContext(withAnthropicKeepalive(r.Context(), options.Config.SSEKeepalive))
 		}
+		if respPolicy.ToolGap > 0 {
+			req = req.WithContext(withOutboundToolGap(req.Context(), respPolicy.ToolGap))
+		}
 		setProtocolObservationHeaders(w, protocolObservation{
 			Protocol: "openai_responses", AccountID: opened.AccountID, PreferAccount: opened.PreferAccount,
 			Failover: opened.Failover, Fingerprint: opened.Fingerprint, Accounts: opened.Accounts, Prep: opened.Prep,
 		})
-		usage, err := streamOpenAIResponses(w, req, opened.Body, responseID, opened.Model, allowedResponsesToolNames(body), optionsFromRequest(req).Keepalive)
+		usage, err := streamOpenAIResponses(w, req, opened.Body, responseID, opened.Model, allowedResponsesToolNames(body), optionsFromRequest(req).Keepalive, respPolicy.MaxTools)
 		ok := err == nil || errors.Is(err, r.Context().Err())
 		status := http.StatusOK
 		if !ok {
@@ -972,7 +1000,7 @@ func serveResponses(w http.ResponseWriter, r *http.Request, options Options) {
 	writeJSON(w, http.StatusOK, responses.BuildObject(responseID, result.Model, content, reasoning, responseToolCalls(toolCalls), usageMap(result.Usage), time.Now().Unix(), stringValue(raw["previous_response_id"]), metadataMap(raw["metadata"])))
 }
 
-func streamOpenAIResponses(w http.ResponseWriter, r *http.Request, body io.Reader, responseID, model string, allowed []string, keepalive time.Duration) (map[string]any, error) {
+func streamOpenAIResponses(w http.ResponseWriter, r *http.Request, body io.Reader, responseID, model string, allowed []string, keepalive time.Duration, maxTools int) (map[string]any, error) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"detail": "streaming is not supported by this response writer"})
@@ -984,7 +1012,10 @@ func streamOpenAIResponses(w http.ResponseWriter, r *http.Request, body io.Reade
 	w.Header().Set("X-Accel-Buffering", "no")
 	w.Header().Set("X-Grok2API-Protocol", "openai_responses")
 	w.WriteHeader(http.StatusOK)
-	streamer := responses.NewLiveStreamer(responseID, model, allowed)
+	if maxTools < 0 {
+		maxTools = 0
+	}
+	streamer := responses.NewLiveStreamerWithMaxTools(responseID, model, allowed, maxTools)
 	writeFrame := func(frame string, force bool) error {
 		if !force {
 			select {
@@ -1000,10 +1031,24 @@ func streamOpenAIResponses(w http.ResponseWriter, r *http.Request, body io.Reade
 		flusher.Flush()
 		return nil
 	}
+	toolGap := outboundToolGapFrom(r.Context())
+	toolsEmitted := 0
 	emitFrames := func(frames []string, force bool) error {
 		for _, frame := range frames {
+			if toolGap > 0 && toolsEmitted > 0 && strings.Contains(frame, "function_call") && strings.Contains(frame, "response.output_item.added") {
+				timer := time.NewTimer(toolGap)
+				select {
+				case <-r.Context().Done():
+					timer.Stop()
+					return r.Context().Err()
+				case <-timer.C:
+				}
+			}
 			if err := writeFrame(frame, force); err != nil {
 				return err
+			}
+			if strings.Contains(frame, "function_call") && strings.Contains(frame, "response.output_item.added") {
+				toolsEmitted++
 			}
 		}
 		return nil
@@ -1247,6 +1292,24 @@ func withAnthropicKeepalive(ctx context.Context, d time.Duration) context.Contex
 	return context.WithValue(ctx, anthropicKeepaliveContextKey{}, d)
 }
 
+type outboundToolGapContextKey struct{}
+
+func withOutboundToolGap(ctx context.Context, d time.Duration) context.Context {
+	return context.WithValue(ctx, outboundToolGapContextKey{}, d)
+}
+
+func outboundToolGapFrom(ctx context.Context) time.Duration {
+	if ctx == nil {
+		return 0
+	}
+	if value := ctx.Value(outboundToolGapContextKey{}); value != nil {
+		if d, ok := value.(time.Duration); ok {
+			return d
+		}
+	}
+	return 0
+}
+
 func streamAnthropicMessagesWithOptions(w http.ResponseWriter, r *http.Request, body io.Reader, messageID, model string, toolsRequested bool, allowed []string, maxTools int, opts anthropicStreamOptions) (map[string]any, error) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -1285,12 +1348,28 @@ func streamAnthropicMessagesWithOptions(w http.ResponseWriter, r *http.Request, 
 		flusher.Flush()
 		return nil
 	}
+	toolGap := outboundToolGapFrom(r.Context())
+	toolsEmitted := 0
 	emitFrames := func(frames []string, force bool) error {
 		for _, frame := range frames {
+			if toolGap > 0 && toolsEmitted > 0 && strings.Contains(frame, "\"tool_use\"") && strings.Contains(frame, "content_block_start") {
+				timer := time.NewTimer(toolGap)
+				select {
+				case <-r.Context().Done():
+					timer.Stop()
+					if !envelopeOpen {
+						return r.Context().Err()
+					}
+				case <-timer.C:
+				}
+			}
 			if err := writeFrame(frame, force); err != nil {
 				return err
 			}
 			envelopeOpen = true
+			if strings.Contains(frame, "\"tool_use\"") && strings.Contains(frame, "content_block_start") {
+				toolsEmitted++
+			}
 		}
 		return nil
 	}
@@ -1588,9 +1667,9 @@ func serveAdminStatus(w http.ResponseWriter, r *http.Request, options Options, p
 	pgConfigured := strings.TrimSpace(options.Config.DatabaseURL) != ""
 
 	payload := map[string]any{
-		"ok":                   true,
-		"setup_needed":         setupNeeded,
-		"version":              buildinfo.Version,
+		"ok":           true,
+		"setup_needed": setupNeeded,
+		"version":      buildinfo.Version,
 		"store": map[string]any{
 			"backend": "hybrid",
 			"postgres": map[string]any{
@@ -2248,6 +2327,13 @@ func firstNonEmpty(values ...string) string {
 	return ""
 }
 
+func upstreamClient(options Options) *grok.Client {
+	if options.Upstream != nil {
+		return options.Upstream
+	}
+	return &grok.Client{BaseURL: options.Config.UpstreamBase}
+}
+
 func listCandidates(ctx context.Context, options Options) ([]pool.Candidate, error) {
 	if len(options.Candidates) > 0 {
 		out := make([]pool.Candidate, len(options.Candidates))
@@ -2539,7 +2625,19 @@ func serveAdminProbeAll(w http.ResponseWriter, r *http.Request, options Options)
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"detail": "model health unavailable"})
 		return
 	}
-	result := options.ModelHealth.RunOnce(r.Context(), "manual_all")
+	// Default: async multi-wave job so large pools are not truncated by one
+	// 150s budget / HTTP timeout. ?sync=1 forces a blocking single response
+	// (still multi-wave until covered or job timeout).
+	sync := r.URL.Query().Get("sync") == "1" || r.URL.Query().Get("sync") == "true"
+	if sync {
+		// Bound the request context so a hung upstream cannot pin the handler forever.
+		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Minute)
+		defer cancel()
+		result := options.ModelHealth.RunOnce(ctx, "manual_all")
+		writeJSON(w, http.StatusOK, result)
+		return
+	}
+	result := options.ModelHealth.StartProbeAll()
 	writeJSON(w, http.StatusOK, result)
 }
 
@@ -2966,7 +3064,7 @@ func serveAdminModelsSync(w http.ResponseWriter, r *http.Request, options Option
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"detail": err.Error()})
 		return
 	}
-	gc := &grok.Client{BaseURL: options.Config.UpstreamBase}
+	gc := upstreamClient(options)
 	for k, v := range gc.Headers(a.Token, options.Config.DefaultModel) {
 		req.Header.Set(k, v)
 	}
@@ -3309,7 +3407,7 @@ func serveAdminProbeAccount(w http.ResponseWriter, r *http.Request, options Opti
 		writeJSON(w, http.StatusNotFound, map[string]any{"detail": err.Error()})
 		return
 	}
-	client := &grok.Client{BaseURL: options.Config.UpstreamBase}
+	client := upstreamClient(options)
 	// Lightweight connectivity probe: open a short streamed completion and abort after headers/body start.
 	probeBody := map[string]any{
 		"model":      model,

@@ -2329,21 +2329,58 @@ async function runProbeAll() {
   toast("已开始全部账号模型探测，请稍候…");
   setLogPanel(
     "probe-result",
-    "正在探测全部账号模型…\n（后台执行中，完成后自动刷新列表）",
+    "正在探测全部账号模型…\n（多波次后台执行，完成后自动刷新列表）",
     { forceShow: true }
   );
   try {
-    const r = await api("/accounts/probe-all", { method: "POST", body: "{}" });
+    // Async multi-wave job: returns immediately, then we poll /model-health.
+    const start = await api("/accounts/probe-all", { method: "POST", body: "{}" });
+    let r = start;
+    const pollDeadline = Date.now() + 35 * 60 * 1000;
+    while (true) {
+      const job = (r && r.running != null) ? r : ((r && r.job) || r);
+      const running = !!(job && job.running);
+      const wave = job && (job.wave || job.waves) || 0;
+      const probed = job && (job.probed || job.count) || 0;
+      const avail = job && (job.available_count ?? job.available) || 0;
+      const failed = job && (job.unavailable_count ?? job.failed) || 0;
+      const rem = job && job.sweep && job.sweep.remaining;
+      const elapsed = Math.max(1, Math.round((Date.now() - startedAt) / 1000));
+      const progressLines = [
+        running ? `全部账号模型探测进行中（${elapsed}s）` : `全部账号模型探测完成（${elapsed}s）`,
+        wave ? `波次 ${wave}` : null,
+        `已探测 ${probed}` + (rem != null ? ` · 剩余 ${rem}` : (job && job.deferred ? ` · 延后 ${job.deferred}` : "")),
+        `可用 ${avail}` + (failed ? ` · 不可用 ${failed}` : ""),
+        job && job.models ? `模型 ${(job.models || []).join(", ")}` : null,
+      ].filter(Boolean);
+      setLogPanel("probe-result", progressLines.join("\n"), { forceShow: true });
+      if (!running) {
+        r = job || r;
+        break;
+      }
+      if (Date.now() > pollDeadline) {
+        throw new Error("探测超时（>35min），请查看 model-health 状态");
+      }
+      await new Promise((res) => setTimeout(res, 2000));
+      try {
+        const st = await api("/model-health");
+        r = (st && st.job) ? st.job : (st && st.last) ? st.last : st;
+        if (st && st.sweep && r && !r.sweep) r.sweep = st.sweep;
+      } catch (_) {
+        // keep looping on transient errors
+      }
+    }
     const elapsed = Math.max(1, Math.round((Date.now() - startedAt) / 1000));
     const lines = [
       `全部账号模型探测完成（${elapsed}s）`,
-      `探测账号 ${r.count ?? 0}` + (r.deferred ? ` · 延后 ${r.deferred}` : ""),
-      `可用 ${r.available_count ?? 0}/${r.count ?? 0}`,
-      `不可用 ${r.unavailable_count ?? 0}`,
+      `探测 ${r.probed ?? r.count ?? 0}` + (r.deferred ? ` · 延后 ${r.deferred}` : ""),
+      `可用 ${r.available_count ?? r.available ?? 0}/${r.count ?? r.probed ?? 0}`,
+      `不可用 ${r.unavailable_count ?? r.failed ?? 0}`,
       `自动处理 ${r.auto_action_count ?? 0}` + (r.kick_cooldown ? ` · 进入冷却 ${r.kick_cooldown}` : ""),
-      `模型 ${(r.models || []).join(", ") || "—"}`,
-    ];
-    const bad = (r.results || []).filter((x) => !x.available);
+      r.waves ? `波次 ${r.waves}` : null,
+      `模型 ${((r.models || []).join(", ") || "—")}`,
+    ].filter(Boolean);
+    const bad = (r.failed_sample || r.results || []).filter((x) => x && !x.available);
     bad.slice(0, 8).forEach((x) => {
       let err = String(x.error || "error");
       if (/free-usage-exhausted|free usage/i.test(err)) {
@@ -2354,8 +2391,7 @@ async function runProbeAll() {
       lines.push(`- ${x.email || x.account_id}: ${err}`);
     });
     setLogPanel("probe-result", lines.join("\n"), { forceShow: true });
-    toast(`探测完成：${r.available_count ?? 0}/${r.count ?? 0} 可用`);
-    // Immediately reflect latest probe cycle on overview text.
+    toast(`探测完成：${r.available_count ?? r.available ?? 0}/${r.count ?? r.probed ?? 0} 可用`);
     statusCache = statusCache || {};
     dashCache = dashCache || {};
     const mh = Object.assign({}, statusCache.model_health || {}, {
@@ -6695,11 +6731,13 @@ async function loadUsageEvents({ reset = false } = {}) {
   $("usage-events-tbody").innerHTML = `<tr><td colspan="14" class="g2a-muted">加载明细中…</td></tr>`;
   if ($("usage-events-info")) $("usage-events-info").textContent = "查询中…";
   try {
+    // Backend stores chat as openai_chat; keep UI label "openai".
+    const protocolFilter = protocol === "openai" ? "openai_chat" : protocol;
     const params = new URLSearchParams({
       page: String(usageEventsPage),
       page_size: String(usageEventsPageSize),
       q,
-      protocol,
+      protocol: protocolFilter,
       ok,
     });
     const data = await api("/usage/events?" + params.toString());

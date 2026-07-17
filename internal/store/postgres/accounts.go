@@ -780,8 +780,9 @@ func (c *Connector) ListAccountAuths(ctx context.Context, limit int, onlyEnabled
 	if limit <= 0 {
 		limit = 50
 	}
-	if limit > 500 {
-		limit = 500
+	// Allow large manual full-pool probes; still hard-capped to protect memory.
+	if limit > 5000 {
+		limit = 5000
 	}
 	sql := `
 		SELECT a.id, a.email, a.payload
@@ -822,6 +823,146 @@ func (c *Connector) ListAccountAuths(ctx context.Context, limit int, onlyEnabled
 }
 
 // SaveLastProbe stores probe result snapshot on account_pool.
+
+// ListAccountAuthsForProbe prioritizes accounts that need health checks:
+// never probed / last fail / oldest probe first. Skips currently cooling accounts.
+// Cap is 5000 so admin "全部模型探测" can cover large live pools in one cycle.
+func (c *Connector) ListAccountAuthsForProbe(ctx context.Context, limit int) ([]AccountAuth, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	if limit > 5000 {
+		limit = 5000
+	}
+	rows, err := c.Pool.Query(ctx, `
+		SELECT a.id, a.email, a.payload
+		FROM accounts a
+		LEFT JOIN account_pool ap ON ap.account_id = a.id
+		WHERE COALESCE(ap.enabled, true) = true
+		  AND COALESCE(ap.disabled_for_quota, false) = false
+		  AND (ap.cooldown_until IS NULL OR ap.cooldown_until <= now())
+		  AND COALESCE(ap.pool_status, 'normal') NOT IN ('expired', 'disabled')
+		  AND (a.expires_at IS NULL OR a.expires_at > now())
+		ORDER BY
+		  CASE
+		    WHEN ap.last_probe_status IS NULL OR ap.last_probe_status = '' THEN 0
+		    WHEN ap.last_probe_status = 'fail' THEN 1
+		    ELSE 2
+		  END ASC,
+		  COALESCE((ap.last_probe->>'probed_at')::bigint, 0) ASC,
+		  a.updated_at ASC
+		LIMIT $1`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]AccountAuth, 0, limit)
+	for rows.Next() {
+		var id string
+		var email *string
+		var payloadBytes []byte
+		if err := rows.Scan(&id, &email, &payloadBytes); err != nil {
+			return nil, err
+		}
+		payload := decodeMap(payloadBytes)
+		token, _ := firstString(payload, "key", "access_token", "token")
+		if strings.TrimSpace(token) == "" {
+			continue
+		}
+		item := AccountAuth{ID: id, Token: token}
+		if email != nil {
+			item.Email = *email
+		} else {
+			item.Email = stringFromMap(payload, "email")
+		}
+		out = append(out, item)
+	}
+	return out, rows.Err()
+}
+
+// SaveLastProbesBatch upserts many last_probe snapshots in one round-trip.
+// Used by concurrent model-health cycles to cut per-account write latency.
+func (c *Connector) SaveLastProbesBatch(ctx context.Context, probes []map[string]any) (int, error) {
+	if c == nil || c.Pool == nil || len(probes) == 0 {
+		return 0, nil
+	}
+	// Chunk to keep SQL payload reasonable under dense full-pool probes.
+	const chunk = 100
+	saved := 0
+	for i := 0; i < len(probes); i += chunk {
+		end := i + chunk
+		if end > len(probes) {
+			end = len(probes)
+		}
+		n, err := c.saveLastProbesChunk(ctx, probes[i:end])
+		saved += n
+		if err != nil {
+			return saved, err
+		}
+	}
+	return saved, nil
+}
+
+func (c *Connector) saveLastProbesChunk(ctx context.Context, probes []map[string]any) (int, error) {
+	if len(probes) == 0 {
+		return 0, nil
+	}
+	// Build unnest arrays for bulk upsert.
+	ids := make([]string, 0, len(probes))
+	payloads := make([][]byte, 0, len(probes))
+	statuses := make([]string, 0, len(probes))
+	for _, probe := range probes {
+		if probe == nil {
+			continue
+		}
+		aid, _ := probe["account_id"].(string)
+		aid = strings.TrimSpace(aid)
+		if aid == "" {
+			continue
+		}
+		// Skip budget-cut placeholders — they are not real probe outcomes.
+		if probe["budget_cut"] == true {
+			continue
+		}
+		raw, err := json.Marshal(probe)
+		if err != nil {
+			continue
+		}
+		status := "ok"
+		if ok, _ := probe["available"].(bool); !ok {
+			status = "fail"
+		}
+		ids = append(ids, aid)
+		payloads = append(payloads, raw)
+		statuses = append(statuses, status)
+	}
+	if len(ids) == 0 {
+		return 0, nil
+	}
+	_, err := c.Pool.Exec(ctx, `
+		INSERT INTO account_pool (account_id, last_probe, last_probe_status, extra, updated_at)
+		SELECT x.account_id, x.last_probe, x.last_probe_status, '{}'::jsonb, now()
+		FROM unnest($1::text[], $2::jsonb[], $3::text[]) AS x(account_id, last_probe, last_probe_status)
+		ON CONFLICT (account_id) DO UPDATE SET
+			last_probe = EXCLUDED.last_probe,
+			last_probe_status = EXCLUDED.last_probe_status,
+			updated_at = now()
+	`, ids, payloads, statuses)
+	if err != nil {
+		// Fallback to per-row so a single bad payload does not drop the batch.
+		n := 0
+		for i := range ids {
+			p := map[string]any{}
+			_ = json.Unmarshal(payloads[i], &p)
+			if e := c.SaveLastProbe(ctx, ids[i], p); e == nil {
+				n++
+			}
+		}
+		return n, err
+	}
+	return len(ids), nil
+}
+
 func (c *Connector) SaveLastProbe(ctx context.Context, accountID string, probe map[string]any) error {
 	accountID = strings.TrimSpace(accountID)
 	if accountID == "" {

@@ -222,6 +222,50 @@ func (c *Client) RenewIfOwner(ctx context.Context, key, expected string, ttlSeco
 	return n > 0, nil
 }
 
+// SAdd adds members to a set and optionally refreshes TTL (ttlSeconds<=0 skips expire).
+func (c *Client) SAdd(ctx context.Context, key string, ttlSeconds int, members ...string) (int64, error) {
+	if len(members) == 0 {
+		return 0, nil
+	}
+	args := append([]string{"SADD", key}, members...)
+	raw, err := c.command(ctx, args...)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := strconv.ParseInt(strings.TrimSpace(raw), 10, 64)
+	if ttlSeconds > 0 {
+		_ = c.Expire(ctx, key, ttlSeconds)
+	}
+	return n, nil
+}
+
+// SMembers returns all members of a set.
+func (c *Client) SMembers(ctx context.Context, key string) ([]string, error) {
+	return c.commandArray(ctx, "SMEMBERS", key)
+}
+
+// SCard returns set cardinality.
+func (c *Client) SCard(ctx context.Context, key string) (int64, error) {
+	raw, err := c.command(ctx, "SCARD", key)
+	if err != nil {
+		return 0, err
+	}
+	return strconv.ParseInt(strings.TrimSpace(raw), 10, 64)
+}
+
+// SRem removes members from a set.
+func (c *Client) SRem(ctx context.Context, key string, members ...string) (int64, error) {
+	if len(members) == 0 {
+		return 0, nil
+	}
+	args := append([]string{"SREM", key}, members...)
+	raw, err := c.command(ctx, args...)
+	if err != nil {
+		return 0, err
+	}
+	return strconv.ParseInt(strings.TrimSpace(raw), 10, 64)
+}
+
 func (c *Client) command(ctx context.Context, args ...string) (string, error) {
 	value, err := c.do(ctx, args...)
 	if err != nil {
