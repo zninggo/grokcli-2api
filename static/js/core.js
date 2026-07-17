@@ -7291,10 +7291,13 @@ async function loadAdminLogs({ reset = false } = {}) {
 
 window.G2AAdmin = { bootstrap, loadDashboard, api, $, toast, PAGE_META, renderAccounts, renderKeys };
   if (document.body && document.body.dataset.page) {
-    if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", () => bootstrap());
-    else bootstrap();
+    const _boot = () => {
+      try { if (document.body.dataset.page === "accounts") renderAccountStatusChips(); } catch (_) {}
+      bootstrap();
+    };
+    if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", _boot);
+    else _boot();
   }
 })();
 /* g2a-cache-bust-20260715-reg-restore-fix */
 
-try { if ($("acc-status-chips")) renderAccountStatusChips(); } catch (_) {}

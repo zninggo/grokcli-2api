@@ -1316,7 +1316,30 @@ function accountStatusFilterLabel(key) {
   return hit ? hit.label : (key || "");
 }
 
-function setAccountStatusFilter(key, { reload = true }
+const ACCOUNT_STATUS_FILTERS = [
+  { key: "", label: "全部", tone: "" },
+  { key: "live", label: "轮询中", tone: "ok" },
+  { key: "cooldown", label: "冷却中", tone: "warn" },
+  { key: "model_blocked", label: "模型封禁", tone: "warn" },
+  { key: "quota_disabled", label: "额度禁用", tone: "bad" },
+  { key: "disabled", label: "已禁用", tone: "bad" },
+  { key: "expired", label: "过期", tone: "bad" },
+];
+
+function accountStatusFilterLabel(key) {
+  const hit = ACCOUNT_STATUS_FILTERS.find((x) => x.key === (key || ""));
+  return hit ? hit.label : (key || "");
+}
+
+function setAccountStatusFilter(key, { reload = true } = {}) {
+  accountsStatusFilter = key || "";
+  try { localStorage.setItem("g2a_accounts_status_filter", accountsStatusFilter); } catch (_) {}
+  if ($("acc-filter-status")) {
+    try { $("acc-filter-status").value = accountsStatusFilter; } catch (_) {}
+  }
+  try { renderAccountStatusChips(); } catch (_) {}
+  if (reload) loadAccountsPage({ reset: true });
+}
 
 function renderAccountStatusChips() {
   const el = $("acc-status-chips");
@@ -1371,6 +1394,7 @@ async function selectAllFilteredAccounts() {
     }
   }
 }
+
 
 function getFilteredAccounts() {
   // Server-side filtering/pagination: accountsList holds current page rows.
@@ -7266,8 +7290,12 @@ async function loadAdminLogs({ reset = false } = {}) {
 
 window.G2AAdmin = { bootstrap, loadDashboard, api, $, toast, PAGE_META, renderAccounts, renderKeys };
   if (document.body && document.body.dataset.page) {
-    if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", () => bootstrap());
-    else bootstrap();
+    const _boot = () => {
+      try { if (document.body.dataset.page === "accounts") renderAccountStatusChips(); } catch (_) {}
+      bootstrap();
+    };
+    if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", _boot);
+    else _boot();
   }
 })();
 /* g2a-cache-bust-20260715-reg-restore-fix */
