@@ -1038,7 +1038,7 @@ def _make_email_receiver(
 
         def wait_for_code(
             self,
-            timeout: float = 120,
+            timeout: float = 300,
             *,
             should_cancel=None,
             poll_interval: float | None = None,
@@ -1254,6 +1254,7 @@ def _prepare_registration_session(
         "batch_total": batch_total,
         # Keep receiver process-local only (not mirrored to Redis).
         "_receiver": receiver,
+        "_email_id": getattr(receiver, "email_id", "") or "",
     }
     with _lock:
         _sessions[sid] = sess
@@ -2538,6 +2539,18 @@ def _run_registration(
         # Password can be validated any time before create; do it while warm.
         client.validate_password(email, password)
 
+        # 发送验证码前先清空收件箱，避免残留旧邮件干扰
+        try:
+            from grok2api.upstream.moemail import cleanup_inbox as _cleanup_inbox
+            _mail_prov2 = (mail_provider or "moemail").strip().lower()
+            _mail_id2 = str(sess.get("_email_id") or "").strip()
+            if _mail_id2:
+                _cleaned = _cleanup_inbox(_mail_id2, provider=_mail_prov2, address=email)
+                if _cleaned > 0:
+                    print(f"[grok-build-auth] 清理了 {_cleaned} 封残留邮件")
+        except Exception as _cln_err:
+            print(f"[grok-build-auth] WARN: 清空收件箱失败(不影响流程): {_cln_err}")
+
         update("registering", "sending email validation code")
         _check_cancel()
         send_res = client.create_email_validation_code(email)
@@ -3037,6 +3050,16 @@ def _run_registration(
             "refresh_token": bool(token.get("refresh_token")),
             "email": email,
         }
+        # 注册成功后自动清理临时邮箱（删除邮箱账号，释放资源）
+        try:
+            from grok2api.upstream.moemail import delete_mailbox as _delete_mailbox
+            _mail_prov = (mail_provider or "moemail").strip().lower()
+            _mail_id = str(sess.get("_email_id") or "").strip()
+            if _mail_id:
+                _delete_mailbox(_mail_id, provider=_mail_prov)
+                print(f"[grok-build-auth] 已删除临时邮箱: {email}")
+        except Exception as _del_err:
+            print(f"[grok-build-auth] WARN: 删除临时邮箱失败(不影响结果): {_del_err}")
         # Optional: auto-push newly registered accounts into sub2api.
         # Controlled by settings → sub2api → auto_push_on_register.
         # Failures are recorded on the session but never fail registration.

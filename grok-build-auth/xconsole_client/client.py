@@ -390,7 +390,7 @@ class XConsoleAuthClient:
             except Exception:
                 return (None, False)
 
-        with ThreadPoolExecutor(max_workers=min(8, len(ordered))) as ex:
+        with ThreadPoolExecutor(max_workers=max(1, min(8, len(ordered)))) as ex:
             futures = {ex.submit(_fetch_and_search, url): url for url in ordered}
             for f in as_completed(futures):
                 h, is_signup = f.result()

@@ -699,6 +699,121 @@ def yyds_fetch_messages(
         return out
 
 
+def yyds_delete_account(
+    email_id: str,
+    *,
+    api_key: str | None = None,
+    base_url: str | None = None,
+) -> bool:
+    """Delete/deactivate a YYDS temporary mailbox (DELETE /v1/accounts/{id})."""
+    if not email_id:
+        return False
+    key = (api_key or MOEMAIL_API_KEY or "").strip()
+    if not key:
+        return False
+    base = normalize_yyds_base_url(base_url or MOEMAIL_BASE_URL)
+    try:
+        with httpx.Client(timeout=15.0) as client:
+            resp = client.delete(
+                f"{base}/v1/accounts/{email_id}",
+                headers=_headers(key),
+            )
+            if resp.status_code < 400:
+                print(f"[moemail] yyds delete mailbox ok: {email_id}")
+                return True
+            print(f"[moemail] yyds delete mailbox {resp.status_code}: {resp.text[:200]}")
+            return False
+    except Exception as e:
+        print(f"[moemail] yyds delete mailbox error: {e}")
+        return False
+
+
+def yyds_cleanup_inbox(
+    email_id: str,
+    *,
+    api_key: str | None = None,
+    base_url: str | None = None,
+    address: str | None = None,
+) -> int:
+    """Delete all messages from a YYDS inbox. Returns count of deleted messages."""
+    key = (api_key or MOEMAIL_API_KEY or "").strip()
+    if not key:
+        return 0
+    base = normalize_yyds_base_url(base_url or MOEMAIL_BASE_URL)
+    deleted = 0
+    try:
+        with httpx.Client(timeout=30.0) as client:
+            headers = _headers(key)
+            params = {}
+            if address:
+                params["address"] = address
+            resp = client.get(
+                f"{base}/v1/inboxes/{email_id}/messages",
+                headers=headers,
+                params={"limit": 50, **params},
+            )
+            if resp.status_code >= 400:
+                return 0
+            data = resp.json()
+            messages = []
+            if isinstance(data, dict) and data.get("success"):
+                d = data.get("data", {})
+                messages = d.get("messages", []) if isinstance(d, dict) else d if isinstance(d, list) else []
+            elif isinstance(data, list):
+                messages = data
+            for msg in messages:
+                msg_id = msg.get("id") or msg.get("messageId")
+                if not msg_id:
+                    continue
+                try:
+                    dresp = client.delete(
+                        f"{base}/v1/messages/{msg_id}",
+                        headers=headers,
+                        params=params,
+                    )
+                    if dresp.status_code < 400:
+                        deleted += 1
+                except Exception:
+                    pass
+            if deleted > 0:
+                print(f"[moemail] yyds cleanup inbox: {address or email_id} deleted {deleted} messages")
+    except Exception as e:
+        print(f"[moemail] yyds cleanup inbox error: {e}")
+    return deleted
+
+
+def delete_mailbox(
+    email_id: str,
+    *,
+    provider: str | None = None,
+    api_key: str | None = None,
+    base_url: str | None = None,
+) -> bool:
+    """Provider-aware mailbox deletion."""
+    prov = normalize_mail_provider(provider, base_url=base_url)
+    if prov == "yyds":
+        return yyds_delete_account(email_id, api_key=api_key, base_url=base_url)
+    print(f"[moemail] delete_mailbox: provider={prov} not supported")
+    return False
+
+
+def cleanup_inbox(
+    email_id: str,
+    *,
+    provider: str | None = None,
+    api_key: str | None = None,
+    base_url: str | None = None,
+    address: str | None = None,
+) -> int:
+    """Provider-aware inbox cleanup."""
+    prov = normalize_mail_provider(provider, base_url=base_url)
+    if prov == "yyds":
+        return yyds_cleanup_inbox(email_id, api_key=api_key, base_url=base_url, address=address)
+    return 0
+
+
+
+
 def gptmail_create_mailbox(
     *,
     name: str | None = None,
