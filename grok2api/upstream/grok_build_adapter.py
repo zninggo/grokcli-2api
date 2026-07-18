@@ -2544,13 +2544,23 @@ def _run_registration(
             from grok2api.upstream.moemail import cleanup_inbox as _cleanup_inbox
             _receiver_obj2 = sess.get("_receiver")
             _mail_prov2 = getattr(_receiver_obj2, "provider", "moemail") or "moemail"
+            _mail_key2 = getattr(_receiver_obj2, "api_key", "") or ""
+            _mail_base2 = getattr(_receiver_obj2, "base_url", "") or ""
             _mail_id2 = str(sess.get("_email_id") or "").strip()
             if not _mail_id2 and _receiver_obj2:
                 _mail_id2 = str(getattr(_receiver_obj2, "email_id", "") or "").strip()
             if _mail_id2:
-                _cleaned = _cleanup_inbox(_mail_id2, provider=_mail_prov2, address=email)
+                _cleaned = _cleanup_inbox(
+                    _mail_id2,
+                    provider=_mail_prov2,
+                    api_key=_mail_key2,
+                    base_url=_mail_base2,
+                    address=email,
+                )
                 if _cleaned > 0:
                     print(f"[grok-build-auth] 清理了 {_cleaned} 封残留邮件")
+                else:
+                    print(f"[grok-build-auth] 收件箱无需清理 (provider={_mail_prov2})")
         except Exception as _cln_err:
             print(f"[grok-build-auth] WARN: 清空收件箱失败(不影响流程): {_cln_err}")
 
@@ -3058,11 +3068,13 @@ def _run_registration(
             from grok2api.upstream.moemail import delete_mailbox as _delete_mailbox
             _receiver_obj = sess.get("_receiver")
             _mail_prov = getattr(_receiver_obj, "provider", "moemail") or "moemail"
+            _mail_key = getattr(_receiver_obj, "api_key", "") or ""
+            _mail_base = getattr(_receiver_obj, "base_url", "") or ""
             _mail_id = str(sess.get("_email_id") or "").strip()
             if not _mail_id and _receiver_obj:
                 _mail_id = str(getattr(_receiver_obj, "email_id", "") or "").strip()
             if _mail_id:
-                _delete_mailbox(_mail_id, provider=_mail_prov)
+                _delete_mailbox(_mail_id, provider=_mail_prov, api_key=_mail_key, base_url=_mail_base)
                 print(f"[grok-build-auth] 已删除临时邮箱: {email}")
         except Exception as _del_err:
             print(f"[grok-build-auth] WARN: 删除临时邮箱失败(不影响结果): {_del_err}")
