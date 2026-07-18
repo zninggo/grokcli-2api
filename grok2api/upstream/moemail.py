@@ -744,39 +744,59 @@ def yyds_cleanup_inbox(
     try:
         with httpx.Client(timeout=30.0) as client:
             headers = _headers(key)
-            params = {}
-            if address:
-                params["address"] = address
-            resp = client.get(
-                f"{base}/v1/inboxes/{email_id}/messages",
-                headers=headers,
-                params={"limit": 50, **params},
-            )
+
+            # 获取邮件列表 — 与 yyds_fetch_messages 相同的回退逻辑
+            messages: list[Any] = []
+            if email_id:
+                resp = client.get(
+                    f"{base}/v1/inboxes/{email_id}/messages",
+                    headers=headers,
+                    params={"limit": 50},
+                )
+                if resp.status_code >= 400 and address:
+                    resp = client.get(
+                        f"{base}/v1/messages",
+                        headers=headers,
+                        params={"address": address, "limit": 50},
+                    )
+            elif address:
+                resp = client.get(
+                    f"{base}/v1/messages",
+                    headers=headers,
+                    params={"address": address, "limit": 50},
+                )
+            else:
+                return 0
+
             if resp.status_code >= 400:
                 return 0
+
             data = resp.json()
-            messages = []
             if isinstance(data, dict) and data.get("success"):
                 d = data.get("data", {})
                 messages = d.get("messages", []) if isinstance(d, dict) else d if isinstance(d, list) else []
             elif isinstance(data, list):
                 messages = data
+
+            # 逐条删除
             for msg in messages:
                 msg_id = msg.get("id") or msg.get("messageId")
                 if not msg_id:
                     continue
                 try:
+                    dparams = {"address": address} if address else None
                     dresp = client.delete(
                         f"{base}/v1/messages/{msg_id}",
                         headers=headers,
-                        params=params,
+                        params=dparams,
                     )
                     if dresp.status_code < 400:
                         deleted += 1
                 except Exception:
                     pass
+
             if deleted > 0:
-                print(f"[moemail] yyds cleanup inbox: {address or email_id} deleted {deleted} messages")
+                print(f"[moemail] yyds cleanup inbox: {address or email_id} deleted {deleted}/{len(messages)} messages")
     except Exception as e:
         print(f"[moemail] yyds cleanup inbox error: {e}")
     return deleted
