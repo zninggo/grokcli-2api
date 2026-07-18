@@ -2542,14 +2542,10 @@ def _run_registration(
         # 发送验证码前先清空收件箱，避免残留旧邮件干扰
         try:
             from grok2api.upstream.moemail import yyds_cleanup_inbox as _yyds_cleanup
-            _receiver_obj2 = sess.get("_receiver")
-            _mail_prov2 = getattr(_receiver_obj2, "provider", "moemail") or "moemail"
-            _mail_key2 = getattr(_receiver_obj2, "api_key", "") or ""
-            _mail_token2 = getattr(_receiver_obj2, "token", "") or ""
-            _mail_base2 = getattr(_receiver_obj2, "base_url", "") or ""
-            _mail_id2 = str(sess.get("_email_id") or "").strip()
-            if not _mail_id2 and _receiver_obj2:
-                _mail_id2 = str(getattr(_receiver_obj2, "email_id", "") or "").strip()
+            _mail_prov2 = getattr(receiver, "provider", "moemail") or "moemail"
+            _mail_key2 = getattr(receiver, "api_key", "") or ""
+            _mail_base2 = getattr(receiver, "base_url", "") or ""
+            _mail_id2 = str(getattr(receiver, "email_id", "") or "").strip()
             if _mail_id2 and _mail_prov2 == "yyds":
                 _cleaned = _yyds_cleanup(
                     _mail_id2,
@@ -3064,13 +3060,10 @@ def _run_registration(
         # 注册成功后自动清理临时邮箱（删除邮箱账号，释放资源）
         try:
             from grok2api.upstream.moemail import delete_mailbox as _delete_mailbox
-            _receiver_obj = sess.get("_receiver")
-            _mail_prov = getattr(_receiver_obj, "provider", "moemail") or "moemail"
-            _mail_key = getattr(_receiver_obj, "api_key", "") or ""
-            _mail_base = getattr(_receiver_obj, "base_url", "") or ""
-            _mail_id = str(sess.get("_email_id") or "").strip()
-            if not _mail_id and _receiver_obj:
-                _mail_id = str(getattr(_receiver_obj, "email_id", "") or "").strip()
+            _mail_prov = getattr(receiver, "provider", "moemail") or "moemail"
+            _mail_key = getattr(receiver, "api_key", "") or ""
+            _mail_base = getattr(receiver, "base_url", "") or ""
+            _mail_id = str(getattr(receiver, "email_id", "") or "").strip()
             if _mail_id:
                 _delete_mailbox(_mail_id, provider=_mail_prov, api_key=_mail_key, base_url=_mail_base)
                 print(f"[grok-build-auth] 已删除临时邮箱: {email}")
