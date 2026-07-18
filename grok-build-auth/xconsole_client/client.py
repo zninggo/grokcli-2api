@@ -371,9 +371,21 @@ class XConsoleAuthClient:
 
         def _fetch_and_search(path: str) -> Tuple[Optional[str], bool]:
             """Return (hash_or_None, is_signup_chunk)."""
+            full = f"https://accounts.x.ai{path}"
+            raw = None
+            for _attempt in range(3):
+                try:
+                    _s, _h, _sc, raw = self._request("GET", full, headers=self._base_headers())
+                    break
+                except Exception:
+                    if _attempt < 2:
+                        import time as _t
+                        _t.sleep(0.5 * (_attempt + 1))
+                        continue
+                    return (None, False)
+            if raw is None:
+                return (None, False)
             try:
-                full = f"https://accounts.x.ai{path}"
-                _s, _h, _sc, raw = self._request("GET", full, headers=self._base_headers())
                 text = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else raw
                 hashes = set(re.findall(r'"([a-f0-9]{42})"', text))
                 if not hashes:

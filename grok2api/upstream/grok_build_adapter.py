@@ -2542,8 +2542,11 @@ def _run_registration(
         # 发送验证码前先清空收件箱，避免残留旧邮件干扰
         try:
             from grok2api.upstream.moemail import cleanup_inbox as _cleanup_inbox
-            _mail_prov2 = (mail_provider or "moemail").strip().lower()
+            _receiver_obj2 = sess.get("_receiver")
+            _mail_prov2 = getattr(_receiver_obj2, "provider", "moemail") or "moemail"
             _mail_id2 = str(sess.get("_email_id") or "").strip()
+            if not _mail_id2 and _receiver_obj2:
+                _mail_id2 = str(getattr(_receiver_obj2, "email_id", "") or "").strip()
             if _mail_id2:
                 _cleaned = _cleanup_inbox(_mail_id2, provider=_mail_prov2, address=email)
                 if _cleaned > 0:
@@ -3053,8 +3056,11 @@ def _run_registration(
         # 注册成功后自动清理临时邮箱（删除邮箱账号，释放资源）
         try:
             from grok2api.upstream.moemail import delete_mailbox as _delete_mailbox
-            _mail_prov = (mail_provider or "moemail").strip().lower()
+            _receiver_obj = sess.get("_receiver")
+            _mail_prov = getattr(_receiver_obj, "provider", "moemail") or "moemail"
             _mail_id = str(sess.get("_email_id") or "").strip()
+            if not _mail_id and _receiver_obj:
+                _mail_id = str(getattr(_receiver_obj, "email_id", "") or "").strip()
             if _mail_id:
                 _delete_mailbox(_mail_id, provider=_mail_prov)
                 print(f"[grok-build-auth] 已删除临时邮箱: {email}")
