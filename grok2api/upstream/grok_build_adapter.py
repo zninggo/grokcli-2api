@@ -2541,26 +2541,24 @@ def _run_registration(
 
         # 发送验证码前先清空收件箱，避免残留旧邮件干扰
         try:
-            from grok2api.upstream.moemail import cleanup_inbox as _cleanup_inbox
+            from grok2api.upstream.moemail import yyds_cleanup_inbox as _yyds_cleanup
             _receiver_obj2 = sess.get("_receiver")
             _mail_prov2 = getattr(_receiver_obj2, "provider", "moemail") or "moemail"
             _mail_key2 = getattr(_receiver_obj2, "api_key", "") or ""
+            _mail_token2 = getattr(_receiver_obj2, "token", "") or ""
             _mail_base2 = getattr(_receiver_obj2, "base_url", "") or ""
             _mail_id2 = str(sess.get("_email_id") or "").strip()
             if not _mail_id2 and _receiver_obj2:
                 _mail_id2 = str(getattr(_receiver_obj2, "email_id", "") or "").strip()
-            if _mail_id2:
-                _cleaned = _cleanup_inbox(
+            if _mail_id2 and _mail_prov2 == "yyds":
+                _cleaned = _yyds_cleanup(
                     _mail_id2,
-                    provider=_mail_prov2,
-                    api_key=_mail_key2,
-                    base_url=_mail_base2,
+                    api_key=_mail_key2 or None,
+                    base_url=_mail_base2 or None,
                     address=email,
                 )
                 if _cleaned > 0:
                     print(f"[grok-build-auth] 清理了 {_cleaned} 封残留邮件")
-                else:
-                    print(f"[grok-build-auth] 收件箱无需清理 (provider={_mail_prov2})")
         except Exception as _cln_err:
             print(f"[grok-build-auth] WARN: 清空收件箱失败(不影响流程): {_cln_err}")
 
