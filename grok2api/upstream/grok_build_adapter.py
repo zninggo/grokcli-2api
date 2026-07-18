@@ -2546,6 +2546,7 @@ def _run_registration(
             _mail_key2 = getattr(receiver, "api_key", "") or ""
             _mail_base2 = getattr(receiver, "base_url", "") or ""
             _mail_id2 = str(getattr(receiver, "email_id", "") or "").strip()
+            print(f"[grok-build-auth] cleanup debug: prov={_mail_prov2} id={_mail_id2[:12] if _mail_id2 else 'EMPTY'} key={'OK' if _mail_key2 else 'EMPTY'}")
             if _mail_id2 and _mail_prov2 == "yyds":
                 _cleaned = _yyds_cleanup(
                     _mail_id2,
@@ -2555,6 +2556,10 @@ def _run_registration(
                 )
                 if _cleaned > 0:
                     print(f"[grok-build-auth] 清理了 {_cleaned} 封残留邮件")
+                else:
+                    print(f"[grok-build-auth] 收件箱无残留邮件")
+            else:
+                print(f"[grok-build-auth] 跳过收件箱清理: prov={_mail_prov2} id_empty={not _mail_id2}")
         except Exception as _cln_err:
             print(f"[grok-build-auth] WARN: 清空收件箱失败(不影响流程): {_cln_err}")
 
