@@ -304,7 +304,15 @@
     <button class="g2a-btn g2a-btn-default" id="btn-acc-select-none">取消选择</button>
     <button class="g2a-btn g2a-btn-default" id="btn-acc-renew-selected">批量续期</button>
     <button class="g2a-btn g2a-btn-default" id="btn-acc-probe-selected">批量模型测试</button>
-    <button class="g2a-btn g2a-btn-default" id="btn-acc-export-selected">导出选中</button>
+    <label class="g2a-sort-wrap" for="export-mode" title="JSON 导出内容级别">
+      <span class="g2a-sort-label">导出级别</span>
+      <select id="export-mode" class="g2a-sort-select" aria-label="JSON 导出级别">
+        <option value="access_only" selected>仅 access（剔 refresh，约 6h）</option>
+        <option value="full">完整备份（含 refresh/SSO）</option>
+        <option value="metadata">脱敏元数据</option>
+      </select>
+    </label>
+    <button class="g2a-btn g2a-btn-default" id="btn-acc-export-selected" title="按上方「导出级别」导出选中账号">导出选中</button>
     <button class="g2a-btn g2a-btn-default" id="btn-acc-export-sso-selected" title="仅导出选中账号的 SSO cookie">导出选中 SSO</button>
     <button class="g2a-btn g2a-btn-default" id="btn-acc-export-sso-all" title="导出所有带 SSO 的账号">导出全部 SSO</button>
     <button class="g2a-btn g2a-btn-primary" id="btn-acc-push-sub2api-selected" title="将选中账号导入到已配置的 sub2api">导入 sub2api（选中）</button>
@@ -450,7 +458,7 @@
   <div class="g2a-card-head">
     <div>
       <h3>JSON 导入 / 导出</h3>
-      <p>上传 auth.json、CLIProxyAPI 的 <code>xai-*.json</code> / <code>type=xai|codex</code> 文件、或本系统导出的完整凭证。支持多文件与实时进度。</p>
+      <p>上传 auth.json、CLIProxyAPI 的 <code>xai-*.json</code> / <code>type=xai|codex</code> 文件、或本系统导出凭证。默认导出「仅 access」（剔除 refresh_token/SSO/密码，约 6 小时后失效）；自用迁移请选「完整备份」。</p>
     </div>
   </div>
   <div class="g2a-form-row g2a-import-controls">
@@ -462,11 +470,19 @@
     <div class="g2a-field g2a-field-check">
       <label class="g2a-check"><input type="checkbox" id="import-merge" checked /> 合并导入</label>
     </div>
+    <div class="g2a-field">
+      <label for="export-mode-json">导出级别</label>
+      <select id="export-mode-json" aria-label="JSON 导出级别">
+        <option value="access_only" selected>仅 access（剔 refresh，约 6h）</option>
+        <option value="full">完整备份（含 refresh/SSO）</option>
+        <option value="metadata">脱敏元数据</option>
+      </select>
+    </div>
     <div class="g2a-field g2a-field-action">
       <label>&nbsp;</label>
       <div class="g2a-actions">
         <button class="g2a-btn g2a-btn-primary" id="btn-import">导入文件</button>
-        <button class="g2a-btn g2a-btn-default" id="btn-export">导出全部</button>
+        <button class="g2a-btn g2a-btn-default" id="btn-export" title="按导出级别导出全部账号">导出全部</button>
       </div>
     </div>
   </div>
@@ -490,6 +506,6 @@
   <script src="/static/dist/api.c4edde3d16.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
   <script src="/static/dist/state.da9974e23b.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
   <script src="/static/dist/auth.fa7b1e0e4d.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
-  <script src="/static/dist/core.e0c8b40fb0.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
+  <script src="/static/dist/core.c36f04b9b5.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
 </body>
 </html>

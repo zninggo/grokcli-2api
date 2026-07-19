@@ -398,9 +398,20 @@ class RefreshBody(BaseModel):
 
 class AccountBulkExportBody(BaseModel):
     ids: list[str] = Field(default_factory=list, max_length=2000)
-    include_secrets: bool = Field(
-        default=True,
-        description="Include access/refresh tokens (required for re-import)",
+    include_secrets: bool | None = Field(
+        default=None,
+        description=(
+            "Legacy flag. True=full secrets, False=metadata only. "
+            "Prefer export_mode. When both omitted, defaults to access_only."
+        ),
+    )
+    export_mode: str | None = Field(
+        default=None,
+        description=(
+            "full | access_only | metadata. "
+            "full=backup with refresh/SSO; access_only=strip refresh_token "
+            "(~6h usable); metadata=redacted summary."
+        ),
     )
 
 
@@ -2898,27 +2909,38 @@ def _run_json_export_job(
     job_id: str,
     *,
     account_ids: list[str] | None,
-    include_secrets: bool,
+    include_secrets: bool | None,
+    export_mode: str | None,
     filename_prefix: str,
 ) -> None:
     """Background: build export JSON and keep bytes process-local for download."""
     try:
+        from grok2api.pool.accounts import normalize_export_mode
+
+        mode = normalize_export_mode(export_mode, include_secrets=include_secrets)
         selected_n = len(account_ids) if account_ids is not None else 0
+        mode_label = {
+            "full": "完整备份",
+            "access_only": "仅 access（无 refresh）",
+            "metadata": "脱敏元数据",
+        }.get(mode, mode)
         _io_job_patch(
             job_id,
             status="running",
             phase="exporting",
             message=(
-                f"正在导出选中账号（{selected_n}）…"
+                f"正在导出选中账号（{selected_n}，{mode_label}）…"
                 if account_ids is not None
-                else "正在导出全部账号…"
+                else f"正在导出全部账号（{mode_label}）…"
             ),
             done=0,
             total=max(1, selected_n or 1),
             percent=10,
+            export_mode=mode,
         )
         result = accounts.export_auth_payload(
             include_secrets=include_secrets,
+            export_mode=mode,
             account_ids=account_ids,
         )
         count = int(result.get("count") or 0)
@@ -2946,7 +2968,7 @@ def _run_json_export_job(
                     ok=False,
                     progress_done=0,
                     progress_total=selected_n,
-                    detail={"selected": selected_n},
+                    detail={"selected": selected_n, "export_mode": mode},
                 )
             except Exception:
                 pass
@@ -2966,17 +2988,30 @@ def _run_json_export_job(
             "exported_at": result.get("exported_at") or time.time(),
             "source": "grokcli-2api",
             "count": count,
+            "export_mode": mode,
             "auth": result.get("auth") or {},
         }
         if result.get("selected") is not None:
             payload["selected"] = result.get("selected")
         if result.get("missing") is not None:
             payload["missing"] = result.get("missing")
+        if mode == "access_only":
+            payload["note"] = (
+                "access_only: refresh_token/SSO/password stripped; "
+                "access tokens typically expire ~6h and cannot be renewed."
+            )
+        elif mode == "metadata":
+            payload["note"] = "metadata: no usable tokens; summary only."
         body = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
         ts = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
-        filename = f"{filename_prefix}-{count}-{ts}.json"
+        mode_suffix = {
+            "full": "full",
+            "access_only": "access-only",
+            "metadata": "metadata",
+        }.get(mode, mode)
+        filename = f"{filename_prefix}-{mode_suffix}-{count}-{ts}.json"
         msg = (
-            f"导出完成：{count} 个账号"
+            f"导出完成：{count} 个账号（{mode_label}）"
             + (f"（选中 {selected_n}）" if account_ids is not None else "")
         )
         _io_job_patch(
@@ -2995,6 +3030,7 @@ def _run_json_export_job(
             finished_at=time.time(),
             percent=100,
             ok=True,
+            export_mode=mode,
         )
         try:
             import grok2api.admin.task_log as task_log
@@ -3010,7 +3046,8 @@ def _run_json_export_job(
                 detail={
                     "count": count,
                     "selected": selected_n if account_ids is not None else None,
-                    "include_secrets": include_secrets,
+                    "include_secrets": mode == "full",
+                    "export_mode": mode,
                     "filename": filename,
                     "bytes": len(body),
                 },
@@ -3225,16 +3262,25 @@ def _export_response(
     download: bool,
     filename_prefix: str = "grok2api-auth-export",
 ) -> Response:
-    payload = {
+    mode = str(result.get("export_mode") or "access_only")
+    payload: dict[str, Any] = {
         "exported_at": result.get("exported_at") or time.time(),
         "source": "grokcli-2api",
         "count": result.get("count", 0),
+        "export_mode": mode,
         "auth": result.get("auth") or {},
     }
     if result.get("selected") is not None:
         payload["selected"] = result.get("selected")
     if result.get("missing") is not None:
         payload["missing"] = result.get("missing")
+    if mode == "access_only":
+        payload["note"] = (
+            "access_only: refresh_token/SSO/password stripped; "
+            "access tokens typically expire ~6h and cannot be renewed."
+        )
+    elif mode == "metadata":
+        payload["note"] = "metadata: no usable tokens; summary only."
     body = json.dumps(payload, ensure_ascii=False, indent=2)
     if not download:
         return JSONResponse(content=payload)
@@ -3254,21 +3300,31 @@ def _export_response(
 def _start_export_job(
     *,
     account_ids: list[str] | None,
-    include_secrets: bool,
+    include_secrets: bool | None = None,
+    export_mode: str | None = None,
     filename_prefix: str,
 ) -> dict[str, Any]:
+    from grok2api.pool.accounts import normalize_export_mode
+
+    mode = normalize_export_mode(export_mode, include_secrets=include_secrets)
     job_id = f"jsonexp_{uuid.uuid4().hex[:16]}"
     now = time.time()
     total_hint = len(account_ids) if account_ids is not None else 0
+    mode_label = {
+        "full": "完整备份",
+        "access_only": "仅 access",
+        "metadata": "脱敏",
+    }.get(mode, mode)
     job = {
         "id": job_id,
         "kind": "json_export",
         "status": "queued",
         "phase": "queued",
+        "export_mode": mode,
         "message": (
-            f"已排队导出选中 {total_hint} 个账号"
+            f"已排队导出选中 {total_hint} 个账号（{mode_label}）"
             if account_ids is not None
-            else "已排队导出全部账号"
+            else f"已排队导出全部账号（{mode_label}）"
         ),
         "total": max(1, total_hint or 1),
         "done": 0,
@@ -3291,6 +3347,7 @@ def _start_export_job(
             "job_id": job_id,
             "account_ids": account_ids,
             "include_secrets": include_secrets,
+            "export_mode": mode,
             "filename_prefix": filename_prefix,
         },
         daemon=True,
@@ -3303,6 +3360,7 @@ def _start_export_job(
         "job_id": job_id,
         "status": "queued",
         "total": job["total"],
+        "export_mode": mode,
         "message": job["message"],
         "poll_url": f"/admin/api/accounts/export/jobs/{job_id}",
         "download_url": f"/admin/api/accounts/export/jobs/{job_id}/download",
@@ -3315,23 +3373,49 @@ async def export_accounts(
     x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
     download: int = 1,
     async_job: int = 0,
+    export_mode: str | None = Query(
+        default=None,
+        description="full | access_only | metadata (default access_only)",
+    ),
+    include_secrets: int | None = Query(
+        default=None,
+        description="Legacy: 1=full, 0=metadata. Prefer export_mode.",
+    ),
 ):
     """
-    Export full auth.json (with tokens) for backup / migration.
+    Export auth map for backup / share.
+
+    Default export_mode=access_only (strips refresh_token/SSO/password so
+    recipients cannot renew past ~6h). Use export_mode=full for migration.
 
     - async_job=1 → start background job, poll /accounts/export/jobs/{id}
     - download=1 → attachment (sync path only)
     - download=0 → JSON body (sync path only)
     """
     require_admin(request, x_admin_token)
+    secrets_flag: bool | None
+    if include_secrets is None:
+        secrets_flag = None
+    else:
+        secrets_flag = bool(int(include_secrets))
     if async_job:
         return _start_export_job(
             account_ids=None,
-            include_secrets=True,
+            include_secrets=secrets_flag,
+            export_mode=export_mode,
             filename_prefix="grok2api-auth-export",
         )
-    result = accounts.export_auth_payload(include_secrets=True)
-    return _export_response(result, download=bool(download))
+    result = accounts.export_auth_payload(
+        include_secrets=secrets_flag,
+        export_mode=export_mode,
+    )
+    mode = str(result.get("export_mode") or "access_only")
+    prefix = {
+        "full": "grok2api-auth-export-full",
+        "access_only": "grok2api-auth-export-access-only",
+        "metadata": "grok2api-auth-export-metadata",
+    }.get(mode, "grok2api-auth-export")
+    return _export_response(result, download=bool(download), filename_prefix=prefix)
 
 
 @router.post("/accounts/export-batch")
@@ -3342,7 +3426,11 @@ async def export_accounts_batch(
     download: int = 1,
     async_job: int = 0,
 ):
-    """Export selected accounts only (multi-select). Supports async_job=1."""
+    """Export selected accounts only (multi-select). Supports async_job=1.
+
+    Default export_mode=access_only (no refresh_token). Pass export_mode=full
+    for complete backup needed for durable re-import.
+    """
     require_admin(request, x_admin_token)
     ids = [str(x).strip() for x in (body.ids or []) if str(x).strip()]
     if not ids:
@@ -3352,19 +3440,27 @@ async def export_accounts_batch(
     if async_job:
         return _start_export_job(
             account_ids=ids,
-            include_secrets=bool(body.include_secrets),
+            include_secrets=body.include_secrets,
+            export_mode=body.export_mode,
             filename_prefix="grok2api-auth-export-selected",
         )
     result = accounts.export_auth_payload(
-        include_secrets=bool(body.include_secrets),
+        include_secrets=body.include_secrets,
+        export_mode=body.export_mode,
         account_ids=ids,
     )
     if not result.get("count"):
         raise HTTPException(status_code=404, detail="no matching accounts to export")
+    mode = str(result.get("export_mode") or "access_only")
+    prefix = {
+        "full": "grok2api-auth-export-selected-full",
+        "access_only": "grok2api-auth-export-selected-access-only",
+        "metadata": "grok2api-auth-export-selected-metadata",
+    }.get(mode, "grok2api-auth-export-selected")
     return _export_response(
         result,
         download=bool(download),
-        filename_prefix="grok2api-auth-export-selected",
+        filename_prefix=prefix,
     )
 
 

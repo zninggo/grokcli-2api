@@ -56,7 +56,7 @@ import grok2api.config as _config
 import grok2api.protocol.history_compact as history_compact
 from grok2api.upstream.models import load_models_from_cache, resolve_model
 
-APP_VERSION = "1.9.91"
+APP_VERSION = "1.9.92-export-modes"
 
 # Per-request usage context (client IP / path / UA) for request-level ledger rows.
 _usage_request_ctx: ContextVar[dict[str, Any] | None] = ContextVar(

@@ -594,16 +594,130 @@ def _normalize_entry(
     return aid, entry
 
 
+# Fields that let a recipient re-login or long-lived renew (dangerous to share).
+_EXPORT_LONG_LIVED_SECRET_FIELDS = (
+    "refresh_token",
+    "sso",
+    "sso_cookie",
+    "sso_token",
+    "session_cookies",
+    "cookies",
+    "cookie",
+    "set_cookie",
+    "set-cookie",
+    "set_cookies",
+    "password",
+    "register_password",
+    "sso_backup_path",
+)
+
+# Full secret set for metadata-only exports (no usable credentials).
+_EXPORT_ALL_SECRET_FIELDS = _EXPORT_LONG_LIVED_SECRET_FIELDS + (
+    "key",
+    "access_token",
+    "token",
+)
+
+
+def normalize_export_mode(
+    export_mode: str | None = None,
+    *,
+    include_secrets: bool | None = None,
+) -> str:
+    """Resolve export mode.
+
+    Modes:
+      - full: complete backup (access + refresh + SSO + passwords) — migration only
+      - access_only: keep short-lived access token (~6h); strip refresh/SSO/password
+      - metadata: redacted summary only (no usable tokens)
+
+    Legacy: include_secrets True/False maps to full / metadata when mode omitted.
+    """
+    mode = str(export_mode or "").strip().lower().replace("-", "_")
+    aliases = {
+        "full": "full",
+        "complete": "full",
+        "backup": "full",
+        "secrets": "full",
+        "access": "access_only",
+        "access_only": "access_only",
+        "access_token": "access_only",
+        "no_refresh": "access_only",
+        "share": "access_only",
+        "safe": "access_only",
+        "metadata": "metadata",
+        "meta": "metadata",
+        "redacted": "metadata",
+        "none": "metadata",
+    }
+    if mode in aliases:
+        return aliases[mode]
+    if include_secrets is False:
+        return "metadata"
+    if include_secrets is True:
+        return "full"
+    # Safe default for unspecified: short-lived access only (cannot renew past ~6h).
+    return "access_only"
+
+
+def _export_entry_for_mode(entry: dict[str, Any], mode: str) -> dict[str, Any]:
+    """Project one account payload according to export mode."""
+    if mode == "full":
+        return dict(entry)
+
+    if mode == "access_only":
+        out = {
+            kk: vv
+            for kk, vv in entry.items()
+            if kk not in _EXPORT_LONG_LIVED_SECRET_FIELDS
+        }
+        # Normalize access field name for re-import of short-lived tokens.
+        tok = entry.get("key") or entry.get("access_token") or entry.get("token")
+        if isinstance(tok, str) and tok.strip():
+            out["key"] = tok
+            out.pop("access_token", None)
+            out.pop("token", None)
+        out["has_refresh_token"] = False
+        out["has_sso"] = False
+        out["export_mode"] = "access_only"
+        # Explicitly ensure long-lived secrets are gone even if aliased keys appear.
+        for k in _EXPORT_LONG_LIVED_SECRET_FIELDS:
+            out.pop(k, None)
+        return out
+
+    # metadata
+    safe = {
+        kk: vv
+        for kk, vv in entry.items()
+        if kk not in _EXPORT_ALL_SECRET_FIELDS
+    }
+    tok = entry.get("key") or entry.get("access_token") or entry.get("token")
+    if isinstance(tok, str):
+        safe["token_hint"] = _mask_token(tok)
+    safe["has_refresh_token"] = bool(entry.get("refresh_token"))
+    safe["has_sso"] = has_sso_value(entry)
+    safe["export_mode"] = "metadata"
+    return safe
+
+
 def export_auth_payload(
     *,
-    include_secrets: bool = True,
+    include_secrets: bool | None = None,
+    export_mode: str | None = None,
     account_ids: list[str] | None = None,
 ) -> dict[str, Any]:
     """
-    Export auth.json map for download/backup.
-    include_secrets=True returns full tokens (needed for re-import).
-    account_ids=None exports all accounts; otherwise only selected ids.
+    Export auth.json map for download/backup/share.
+
+    export_mode:
+      - full: all secrets (required for durable re-import / migration)
+      - access_only: access token only; strips refresh_token / SSO / passwords
+      - metadata: no usable credentials
+
+    include_secrets kept for backward compatibility:
+      True → full, False → metadata, when export_mode is omitted.
     """
+    mode = normalize_export_mode(export_mode, include_secrets=include_secrets)
     data = read_auth_map()
     wanted: set[str] | None = None
     if account_ids is not None:
@@ -615,6 +729,7 @@ def export_auth_payload(
                 "count": 0,
                 "auth_file": str(AUTH_FILE),
                 "exported_at": time.time(),
+                "export_mode": mode,
                 "selected": 0,
                 "missing": [],
             }
@@ -627,46 +742,28 @@ def export_auth_payload(
             "count": 0,
             "auth_file": str(AUTH_FILE),
             "exported_at": time.time(),
+            "export_mode": mode,
         }
         if wanted is not None:
             out_empty["selected"] = len(wanted)
             out_empty["missing"] = sorted(wanted)
         return out_empty
-    if include_secrets:
-        out = {k: dict(v) if isinstance(v, dict) else v for k, v in data.items()}
-    else:
-        out = {}
-        for k, v in data.items():
-            if not isinstance(v, dict):
-                continue
-            safe = {
-                kk: vv
-                for kk, vv in v.items()
-                if kk
-                not in (
-                    "key",
-                    "access_token",
-                    "token",
-                    "refresh_token",
-                    "sso",
-                    "sso_cookie",
-                    "sso_token",
-                    "password",
-                    "register_password",
-                )
-            }
-            tok = v.get("key") or v.get("access_token") or v.get("token")
-            if isinstance(tok, str):
-                safe["token_hint"] = _mask_token(tok)
-            safe["has_refresh_token"] = bool(v.get("refresh_token"))
-            safe["has_sso"] = has_sso_value(v)
-            out[k] = safe
+
+    out: dict[str, Any] = {}
+    for k, v in data.items():
+        if not isinstance(v, dict):
+            out[k] = v
+            continue
+        out[k] = _export_entry_for_mode(v, mode)
+
     result = {
         "ok": True,
         "auth": out,
         "count": len(out),
         "auth_file": str(AUTH_FILE),
         "exported_at": time.time(),
+        "export_mode": mode,
+        "include_secrets": mode == "full",
     }
     if wanted is not None:
         result["selected"] = len(wanted)
